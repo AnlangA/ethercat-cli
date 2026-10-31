@@ -1,0 +1,14 @@
+[package]
+name = "ethercat-ssc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure-Rust Beckhoff Slave Stack Code (SSC) project/config preprocessor, XLSX/CSV/XML/EDS/TMC Object Dictionary C code generator, ESI generator/updater, and unified patch engine"
+
+[dependencies]
+crc32fast.workspace = true
+ethercat-eeprom.workspace = true
+ethercat-wire.workspace = true
+flate2.workspace = true
+serde.workspace = true
+serde_json.workspace = true

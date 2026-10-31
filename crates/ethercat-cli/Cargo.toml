@@ -1,0 +1,20 @@
+[package]
+name = "ethercat-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AI-ready EtherCAT protocol CLI: guarded SII/ESI EEPROM interface, pure-Rust Beckhoff SSC/OD codegen, Wireshark-compatible frame dissector, raw frame TX/RX, ESC registers, CoE SDO, and PDO field access"
+
+[[bin]]
+name = "ethercat-cli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+ethercat-eeprom.workspace = true
+ethercat-master.workspace = true
+ethercat-ssc.workspace = true
+ethercat-wire.workspace = true
+serde.workspace = true
+serde_json.workspace = true

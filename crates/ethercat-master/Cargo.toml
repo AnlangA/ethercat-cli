@@ -1,0 +1,13 @@
+[package]
+name = "ethercat-master"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "EtherCAT master bus scanner, AL state controller, ESC hardware register interface, CoE SDO/OD client, cyclic PDO exchange, and virtual slave ring simulator"
+
+[dependencies]
+clap.workspace = true
+ethercat-eeprom.workspace = true
+ethercat-wire.workspace = true
+serde.workspace = true
+serde_json.workspace = true
