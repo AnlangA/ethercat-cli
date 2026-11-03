@@ -1390,6 +1390,43 @@ impl EntryInfo {
             self.name.clone()
         }
     }
+
+    /// Inherit missing fields from a referenced base `EntryInfo` (`EntryInfo::InheritFrom` parity).
+    pub fn inherit_from(&mut self, base: &Self) {
+        if self.name.trim().is_empty() {
+            self.name = base.name.clone();
+        }
+        if self.data_type_id == 0 {
+            self.data_type_id = base.data_type_id;
+        }
+        if self.bit_length <= 0 {
+            self.bit_length = base.bit_length;
+        }
+        if self.default_data.is_empty() {
+            self.default_data = base.default_data.clone();
+        }
+        if self.min_data.is_empty() {
+            self.min_data = base.min_data.clone();
+        }
+        if self.max_data.is_empty() {
+            self.max_data = base.max_data.clone();
+        }
+        if self.unit.is_none() {
+            self.unit = base.unit;
+        }
+        if self.description.is_empty() {
+            self.description = base.description.clone();
+        }
+        if self.coe_read_callback.is_empty() {
+            self.coe_read_callback = base.coe_read_callback.clone();
+        }
+        if self.coe_write_callback.is_empty() {
+            self.coe_write_callback = base.coe_write_callback.clone();
+        }
+        if self.category.is_none() {
+            self.category = base.category;
+        }
+    }
 }
 
 /// CoE Object Dictionary object (`0x0000..=0xFFFF`).
@@ -2281,6 +2318,13 @@ impl ObjectInfo {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OdValidationReport {
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+    pub skipped_objects: Vec<u16>,
+}
+
 /// Ordered CoE Object Dictionary (`BTreeMap<u16, ObjectInfo>` sorted by object index).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ObjectInfoCollection {
@@ -2660,12 +2704,197 @@ impl ObjectInfoCollection {
             }
         }
         if auto_create_pdos_and_sm {
-            // Note: Beckhoff aligns auto-created PDOs to 2 bytes (16-bit word) in SSC wizard / CSV import!
-            // Wait: check `RichAppObjects.h`! In `RichApp.csv`, `0x6000` has 1+2+5+8+32+32 = 80 bits (10 bytes),
-            // and `0x7000` has 1+7+8+16+32 = 64 bits (8 bytes); 1-byte vs 2-byte alignment is identical for even bytes,
-            // and `AutoCreatePdoMappingObjects(logger, OverwriteExisting)` passes `AlignBytes = 1` (line 26294: `ldc.i4.1`)!
             self.auto_create_pdo_mapping_objects(false, 1);
             self.auto_create_sm_assign_objects(false);
+        }
+    }
+
+    /// Inherit objects and missing subentries from a referenced base `ObjectInfoCollection`
+    /// (`ObjectInfoCollection::InheritObjects` / `ObjectInfo::InheritFrom` parity).
+    pub fn inherit_objects(&mut self, base: &Self) {
+        if self.device_profile == 0 && base.device_profile != 0 {
+            self.device_profile = base.device_profile;
+        }
+        if self.module_profile == 0 && base.module_profile != 0 {
+            self.module_profile = base.module_profile;
+        }
+        if self.index_increment == 0 && base.index_increment != 0 {
+            self.index_increment = base.index_increment;
+        }
+        if self.pdo_index_increment == 0 && base.pdo_index_increment != 0 {
+            self.pdo_index_increment = base.pdo_index_increment;
+        }
+
+        for (&idx, base_obj) in &base.objects {
+            if let Some(cur_obj) = self.objects.get_mut(&idx) {
+                if cur_obj.name.trim().is_empty() {
+                    cur_obj.name = base_obj.name.clone();
+                }
+                if cur_obj.object_code == ObjectCode::None {
+                    cur_obj.object_code = base_obj.object_code;
+                }
+                if !cur_obj.has_explicit_category && base_obj.has_explicit_category {
+                    cur_obj.category = base_obj.category;
+                    cur_obj.has_explicit_category = true;
+                }
+                if cur_obj.description.is_empty() {
+                    cur_obj.description = base_obj.description.clone();
+                }
+                if cur_obj.coe_read_callback.is_empty() {
+                    cur_obj.coe_read_callback = base_obj.coe_read_callback.clone();
+                }
+                if cur_obj.coe_write_callback.is_empty() {
+                    cur_obj.coe_write_callback = base_obj.coe_write_callback.clone();
+                }
+                for base_entry in &base_obj.entries {
+                    if let Some(cur_entry) = cur_obj.entry_mut(base_entry.sub_index) {
+                        cur_entry.inherit_from(base_entry);
+                    } else if cur_obj.object_code != ObjectCode::Variable {
+                        cur_obj.entries.push(base_entry.clone());
+                    }
+                }
+                cur_obj.finalize_layout();
+            } else {
+                self.objects.insert(idx, base_obj.clone());
+            }
+        }
+    }
+
+    /// Validate CoE Object Dictionary rules (`ObjectInfoCollection::ValidateObjects` parity).
+    /// When `remove_invalid_objects` is true (`SSC OD Tool /f` force mode), objects with validation
+    /// errors are removed and listed in `skipped_objects`.
+    pub fn validate_objects(
+        &mut self,
+        check_ssc_alignment_rules: bool,
+        remove_invalid_objects: bool,
+    ) -> OdValidationReport {
+        const RESERVED_C_WORDS: &[&str] = &[
+            "auto", "break", "case", "char", "const", "continue", "default", "do", "double",
+            "else", "enum", "extern", "float", "for", "goto", "if", "inline", "int", "long",
+            "register", "restrict", "return", "short", "signed", "sizeof", "static", "struct",
+            "switch", "typedef", "union", "unsigned", "void", "volatile", "while",
+        ];
+
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+        let mut invalid_indices: Vec<u16> = Vec::new();
+        let is_mdp = self.device_profile == 5001;
+
+        for (&idx, obj) in &self.objects {
+            let mut obj_has_error = false;
+            if idx >= 0x1000 && obj.object_code == ObjectCode::None && obj.entries.is_empty() {
+                errors.push(format!(
+                    "Object 0x{idx:04X} ('{}') has no ObjectCode and no subentries",
+                    obj.name
+                ));
+                obj_has_error = true;
+            }
+
+            let trimmed_obj_name = obj.name.trim();
+            if !trimmed_obj_name.is_empty()
+                && RESERVED_C_WORDS
+                    .iter()
+                    .any(|w| w.eq_ignore_ascii_case(trimmed_obj_name))
+            {
+                warnings.push(format!(
+                    "Object 0x{idx:04X} name '{}' is a reserved C keyword",
+                    obj.name
+                ));
+            }
+
+            let has_coe_cb = !obj.coe_read_callback.trim().is_empty()
+                || !obj.coe_write_callback.trim().is_empty();
+
+            for e in &obj.entries {
+                let si = e.sub_index;
+                let trimmed_ename = e.name.trim();
+                if !trimmed_ename.is_empty()
+                    && RESERVED_C_WORDS
+                        .iter()
+                        .any(|w| w.eq_ignore_ascii_case(trimmed_ename))
+                {
+                    warnings.push(format!(
+                        "Entry 0x{idx:04X}.{si} name '{}' is a reserved C keyword",
+                        e.name
+                    ));
+                }
+
+                if matches!(
+                    e.flags.pdo_mapping,
+                    PdoMappingMode::RxOrTx | PdoMappingMode::TxAndRx
+                ) {
+                    warnings.push(format!(
+                        "Entry 0x{idx:04X}.{si} ('{}') allows both RxPDO and TxPDO mapping",
+                        e.effective_name()
+                    ));
+                }
+
+                if is_mdp && (obj.object_code == ObjectCode::Variable || si > 0) {
+                    if (0x6000..=0x6FFF).contains(&idx) && e.flags.pdo_mapping == PdoMappingMode::Rx
+                    {
+                        errors.push(format!(
+                            "MDP input entry 0x{idx:04X}.{si} ('{}') cannot be mapped to RxPDO",
+                            e.effective_name()
+                        ));
+                        obj_has_error = true;
+                    } else if (0x7000..=0x7FFF).contains(&idx)
+                        && e.flags.pdo_mapping == PdoMappingMode::Tx
+                    {
+                        errors.push(format!(
+                            "MDP output entry 0x{idx:04X}.{si} ('{}') cannot be mapped to TxPDO",
+                            e.effective_name()
+                        ));
+                        obj_has_error = true;
+                    }
+                }
+
+                if check_ssc_alignment_rules
+                    && !obj.is_enum_object()
+                    && obj.object_code != ObjectCode::Variable
+                    && !has_coe_cb
+                    && e.coe_read_callback.trim().is_empty()
+                    && e.coe_write_callback.trim().is_empty()
+                    && si > 0
+                    && e.data_type_id != 0
+                    && e.bit_length > 0
+                {
+                    if e.bit_length <= 8 {
+                        let start_byte = e.bit_offset / 8;
+                        let end_byte = (e.bit_offset + e.bit_length - 1) / 8;
+                        if start_byte != end_byte {
+                            errors.push(format!(
+                                "Entry 0x{idx:04X}.{si} ({} bits at bit offset {}) overlaps a byte border without CoE callback",
+                                e.bit_length, e.bit_offset
+                            ));
+                            obj_has_error = true;
+                        }
+                    } else if e.bit_offset % 16 != 0 {
+                        errors.push(format!(
+                            "Entry 0x{idx:04X}.{si} ({} bits at bit offset {}) does not start at a 16-bit word border without CoE callback",
+                            e.bit_length, e.bit_offset
+                        ));
+                        obj_has_error = true;
+                    }
+                }
+            }
+
+            if obj_has_error {
+                invalid_indices.push(idx);
+            }
+        }
+
+        let mut skipped_objects = Vec::new();
+        if remove_invalid_objects {
+            for idx in invalid_indices {
+                self.objects.remove(&idx);
+                skipped_objects.push(idx);
+            }
+        }
+
+        OdValidationReport {
+            errors,
+            warnings,
+            skipped_objects,
         }
     }
 

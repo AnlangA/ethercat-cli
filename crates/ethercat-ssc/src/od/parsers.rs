@@ -1,17 +1,20 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::archive::{bytes_to_text, encode_zip_archive, ZipArchiveReader};
-use crate::model::PROJECT_DEFAULT_SSC_OBJECTS;
+use crate::archive::{bytes_to_text, encode_zip_archive, read_gzip_or_plain, ZipArchiveReader};
+use crate::model::{SlaveProject, PROJECT_DEFAULT_SSC_OBJECTS};
+use crate::od::builtin_ods::build_project_object_dictionary;
 use crate::od::types::{
-    convert_table_value_to_default_data, parse_enum_type_syntax, resolve_data_type_name,
-    reverse_hex_byte_pairs, AccessFlags, EntryFlags, EntryInfo, ModuleCoEInitCmd,
-    ModuleObjectInfoCollection, ObjectCategory, ObjectCode, ObjectInfo, ObjectInfoCollection,
-    PdoMappingMode, SlaveApplication,
+    convert_table_value_to_default_data, create_esi_syntax_for_entry, get_data_type,
+    parse_enum_type_syntax, resolve_data_type_name, reverse_hex_byte_pairs, AccessFlags,
+    EntryFlags, EntryInfo, ModuleCoEInitCmd, ModuleObjectInfoCollection, ObjectCategory,
+    ObjectCode, ObjectInfo, ObjectInfoCollection, PdoMappingMode, SlaveApplication,
 };
 use crate::xml_dom::{parse_dom_bytes, parse_dom_file, render_compact_xml, DomElement, DomNode};
 use ethercat_wire::error::{CliError, Result};
+
+const MAX_OD_REFERENCE_DEPTH: usize = 3;
 
 /// Exact CSV wizard template matching `ET9300Utilities.ApplicationHandler` `MyApplication_csv_SscWizard.txt`.
 pub const CSV_WIZARD_TEMPLATE: &str = concat!(
@@ -223,7 +226,7 @@ pub fn parse_single_application_file_with_sheet(
         .unwrap_or("")
         .to_ascii_lowercase();
     let mut app = match ext.as_str() {
-        "xlsx" => parse_xlsx_application(path, worksheet_index)?,
+        "xlsx" | "xlsm" => parse_xlsx_application(path, worksheet_index)?,
         "csv" | "txt" | "tsv" => parse_csv_application(path)?,
         "xml" | "esp" => parse_xml_application(path)?,
         "eds" => parse_eds_application(path)?,
@@ -306,7 +309,20 @@ fn parse_delimited_grid(text: &str, delimiter: char) -> Vec<Vec<String>> {
     rows
 }
 
+fn canonical_or_normalized_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path)
+        .unwrap_or_else(|_| PathBuf::from(path.to_string_lossy().to_ascii_lowercase()))
+}
+
 fn parse_csv_application(path: &Path) -> Result<SlaveApplication> {
+    let ancestors = vec![canonical_or_normalized_path(path)];
+    parse_csv_application_with_ancestors(path, &ancestors)
+}
+
+fn parse_csv_application_with_ancestors(
+    path: &Path,
+    ancestors: &[PathBuf],
+) -> Result<SlaveApplication> {
     let bytes = fs::read(path)?;
     let text = bytes_to_text(&bytes);
     let first_line = text.lines().next().unwrap_or("");
@@ -322,7 +338,7 @@ fn parse_csv_application(path: &Path) -> Result<SlaveApplication> {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("Application");
-    let od = parse_raw_table_grid(&grid, stem, true)?;
+    let od = parse_raw_table_grid_with_refs(&grid, stem, true, path.parent(), ancestors)?;
     let app_name = if od.name.is_empty() {
         stem.to_string()
     } else {
@@ -380,6 +396,15 @@ fn excel_cell_ref_to_col_idx(cell_ref: &str) -> usize {
 fn parse_xlsx_application(
     path: &Path,
     selected_worksheet_index: Option<usize>,
+) -> Result<SlaveApplication> {
+    let ancestors = vec![canonical_or_normalized_path(path)];
+    parse_xlsx_application_with_ancestors(path, selected_worksheet_index, &ancestors)
+}
+
+fn parse_xlsx_application_with_ancestors(
+    path: &Path,
+    selected_worksheet_index: Option<usize>,
+    ancestors: &[PathBuf],
 ) -> Result<SlaveApplication> {
     let archive = ZipArchiveReader::open(path)?;
     let stem = path
@@ -477,7 +502,7 @@ fn parse_xlsx_application(
             ))
         })?;
         let grid = parse_worksheet_xml_to_grid(sh_bytes, &shared_strings)?;
-        let mut od = parse_raw_table_grid(&grid, &stem, false)?;
+        let mut od = parse_raw_table_grid_with_refs(&grid, &stem, false, path.parent(), ancestors)?;
         od.name = app.name.clone();
         app.od = od;
         sync_mdp_f000_into_app(&mut app);
@@ -525,11 +550,13 @@ fn parse_xlsx_application(
             || lower_name == "application"
             || app.od.objects.is_empty()
         {
-            let mut od = parse_raw_table_grid(&grid, &stem, false)?;
+            let mut od =
+                parse_raw_table_grid_with_refs(&grid, &stem, false, path.parent(), ancestors)?;
             od.name = app.name.clone();
             app.od = od;
         } else {
-            let mut mod_od = parse_raw_table_grid(&grid, sh_name, false)?;
+            let mut mod_od =
+                parse_raw_table_grid_with_refs(&grid, sh_name, false, path.parent(), ancestors)?;
             let mod_ident = (app.modules.len() as u32) + 1;
             mod_od.source_code_prefix = format!("Module0x{mod_ident:08X}");
             app.modules.push(ModuleObjectInfoCollection {
@@ -674,15 +701,98 @@ impl TableColumns {
     }
 }
 
-/// Core 2D table parser shared between `.csv` and `.xlsx` (`RawTableParser` parity).
+fn extract_od_reference_target(cells_after_key: &[String]) -> Option<String> {
+    for cell in cells_after_key {
+        let trimmed = cell.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(pos) = lower.find("(file:") {
+            let rest = &trimmed[pos + 6..];
+            let inner = rest.split(')').next().unwrap_or(rest).trim();
+            let clean = inner.trim_matches('"').trim_matches('\'').trim();
+            if !clean.is_empty() {
+                return Some(clean.to_string());
+            }
+        }
+    }
+    let val1 = cells_after_key.first().map(|s| s.trim()).unwrap_or("");
+    let clean = val1.trim_matches('"').trim_matches('\'').trim();
+    if clean.is_empty() || clean == "0" || clean == "-" {
+        None
+    } else {
+        Some(clean.to_string())
+    }
+}
+
+fn resolve_od_reference_path(target: &str, base_dir: Option<&Path>) -> Option<PathBuf> {
+    let raw_p = Path::new(target);
+    let candidates: Vec<PathBuf> = if raw_p.is_absolute() || base_dir.is_none() {
+        vec![raw_p.to_path_buf()]
+    } else if let Some(dir) = base_dir {
+        let mut list = vec![dir.join(raw_p)];
+        if raw_p.extension().is_none() {
+            for ext in ["xlsx", "xlsm", "csv", "xml"] {
+                list.push(dir.join(format!("{target}.{ext}")));
+            }
+        }
+        list
+    } else {
+        Vec::new()
+    };
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+fn load_referenced_od(ref_path: &Path, ancestors: &[PathBuf]) -> Result<ObjectInfoCollection> {
+    if ancestors.len() > MAX_OD_REFERENCE_DEPTH {
+        return Err(CliError::Validation(format!(
+            "Maximum OD_Reference nesting depth ({MAX_OD_REFERENCE_DEPTH}) exceeded at '{}'",
+            ref_path.display()
+        )));
+    }
+    let canon = canonical_or_normalized_path(ref_path);
+    if ancestors.contains(&canon) {
+        return Err(CliError::Validation(format!(
+            "Circular or self OD_Reference detected for '{}'",
+            ref_path.display()
+        )));
+    }
+    let mut next_ancestors = ancestors.to_vec();
+    next_ancestors.push(canon);
+
+    let ext = ref_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mut app = match ext.as_str() {
+        "csv" | "txt" | "tsv" => parse_csv_application_with_ancestors(ref_path, &next_ancestors)?,
+        "xlsx" | "xlsm" => parse_xlsx_application_with_ancestors(ref_path, None, &next_ancestors)?,
+        _ => parse_single_application_file(ref_path, false)?,
+    };
+    app.od.finalize_and_validate(true);
+    Ok(app.od)
+}
+
+/// Core 2D table parser shared between `.csv` and `.xlsx`/`.xlsm` (`RawTableParser` parity).
+#[allow(dead_code)]
 fn parse_raw_table_grid(
     grid: &[Vec<String>],
     default_name: &str,
     use_profile_title_as_name: bool,
 ) -> Result<ObjectInfoCollection> {
+    parse_raw_table_grid_with_refs(grid, default_name, use_profile_title_as_name, None, &[])
+}
+
+fn parse_raw_table_grid_with_refs(
+    grid: &[Vec<String>],
+    default_name: &str,
+    use_profile_title_as_name: bool,
+    base_dir: Option<&Path>,
+    ancestors: &[PathBuf],
+) -> Result<ObjectInfoCollection> {
     let mut od = ObjectInfoCollection::new(default_name);
     let mut header_row_idx = None;
     let mut cols = TableColumns::default();
+    let mut od_reference_targets: Vec<String> = Vec::new();
 
     // 1. Scan metadata rows until header row (`Index`)
     for (r_idx, row) in grid.iter().enumerate() {
@@ -749,6 +859,11 @@ fn parse_raw_table_grid(
                 "pdoindexincrement" | "pdo index increment" => {
                     if let Some(pinc) = parse_u16_any(val1) {
                         od.pdo_index_increment = pinc;
+                    }
+                }
+                _ if key_low.starts_with("od_reference") || key_low.starts_with("od reference") => {
+                    if let Some(target) = extract_od_reference_target(&row[first_col + 1..]) {
+                        od_reference_targets.push(target);
                     }
                 }
                 _ => {}
@@ -885,7 +1000,7 @@ fn parse_raw_table_grid(
             let Some(ref mut obj) = current_obj else {
                 continue;
             };
-            let si_list = parse_subindex_range(raw_si)?;
+            let (si_list, is_range) = parse_subindex_range(raw_si)?;
             let is_enum = obj.is_enum_object();
             // For ENUM `0x0800..0x0FFF`, check if the parent object's name (`DT0800EN08`) defines the bit width
             let enum_bits = if is_enum {
@@ -902,7 +1017,8 @@ fn parse_raw_table_grid(
                 Some(ObjectCategory::parse_str(raw_moc))
             };
             for si in si_list {
-                let expanded_name = raw_name.replace("{_SI_}", &si.to_string());
+                let expanded_name = format_subindex_template(raw_name, si, is_range);
+                let expanded_desc = format_subindex_template(raw_desc, si, is_range);
                 let mut entry = build_entry_from_table_cells(
                     si,
                     &expanded_name,
@@ -916,7 +1032,7 @@ fn parse_raw_table_grid(
                     raw_rxtx,
                     raw_cread,
                     raw_cwrite,
-                    raw_desc,
+                    &expanded_desc,
                     is_enum,
                 )?;
                 entry.category = entry_cat;
@@ -934,6 +1050,20 @@ fn parse_raw_table_grid(
         }
     }
 
+    // Apply `OD_Reference` base dictionary inheritance (`RawTableParser` / `InheritObjects` parity)
+    for target in &od_reference_targets {
+        let ref_path = resolve_od_reference_path(target, base_dir).ok_or_else(|| {
+            CliError::Validation(format!(
+                "Referenced OD file '{target}' not found{}",
+                base_dir
+                    .map(|d| format!(" (searched relative to '{}')", d.display()))
+                    .unwrap_or_default()
+            ))
+        })?;
+        let ref_od = load_referenced_od(&ref_path, ancestors)?;
+        od.inherit_objects(&ref_od);
+    }
+
     Ok(od)
 }
 
@@ -943,41 +1073,105 @@ impl ObjectInfo {
     }
 }
 
-fn parse_subindex_range(raw_si: &str) -> Result<Vec<u8>> {
+fn normalize_subindex_bound(raw: &str) -> &str {
+    let mut s = raw.trim();
+    for prefix in ["0xnn+", "0Xnn+", "0xNN+", "0XNN+", "n+", "N+"] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest.trim();
+            break;
+        }
+    }
+    s
+}
+
+fn parse_subindex_bound(raw: &str, full_expr: &str) -> Result<u8> {
+    let norm = normalize_subindex_bound(raw);
+    if norm.eq_ignore_ascii_case("partial") || norm.eq_ignore_ascii_case("n") {
+        return Ok(0);
+    }
+    let val_u16 = parse_u16_any(norm).ok_or_else(|| {
+        CliError::SscInvalidData(format!("Invalid subindex '{raw}' in '{full_expr}'"))
+    })?;
+    u8::try_from(val_u16).map_err(|_| {
+        CliError::SscInvalidData(format!("Subindex {val_u16} exceeds 255 in '{full_expr}'"))
+    })
+}
+
+fn split_subindex_range(s: &str) -> Option<(&str, &str)> {
+    if let Some(pair) = s.split_once('\u{2026}') {
+        return Some(pair);
+    }
+    if let Some(pair) = s.split_once("...") {
+        return Some(pair);
+    }
+    if let Some(pair) = s.split_once("..") {
+        return Some(pair);
+    }
+    if let Some(idx) = s.find('-') {
+        if idx > 0 {
+            return Some((&s[..idx], &s[idx + 1..]));
+        }
+    }
+    None
+}
+
+fn parse_subindex_range(raw_si: &str) -> Result<(Vec<u8>, bool)> {
     let t = raw_si.trim();
     if t.is_empty() {
-        return Ok(vec![0]);
+        return Ok((vec![0], false));
     }
-    if let Some((lo_s, hi_s)) = t.split_once("..").or_else(|| t.split_once('-')) {
-        let lo_u16 = parse_u16_any(lo_s).ok_or_else(|| {
-            CliError::SscInvalidData(format!("Invalid subindex range start in '{raw_si}'"))
-        })?;
-        let hi_u16 = parse_u16_any(hi_s).ok_or_else(|| {
-            CliError::SscInvalidData(format!("Invalid subindex range end in '{raw_si}'"))
-        })?;
-        let lo = u8::try_from(lo_u16).map_err(|_| {
-            CliError::SscInvalidData(format!(
-                "Subindex range start {lo_u16} exceeds 255 in '{raw_si}'"
-            ))
-        })?;
-        let hi = u8::try_from(hi_u16).map_err(|_| {
-            CliError::SscInvalidData(format!(
-                "Subindex range end {hi_u16} exceeds 255 in '{raw_si}'"
-            ))
-        })?;
+    if let Some((lo_s, hi_s)) = split_subindex_range(t) {
+        let lo = parse_subindex_bound(lo_s, raw_si)?;
+        let hi = parse_subindex_bound(hi_s, raw_si)?;
         if hi < lo {
             return Err(CliError::SscInvalidData(format!(
                 "Invalid descending subindex range '{raw_si}'"
             )));
         }
-        return Ok((lo..=hi).collect());
+        return Ok(((lo..=hi).collect(), true));
     }
-    let single_u16 = parse_u16_any(t)
-        .ok_or_else(|| CliError::SscInvalidData(format!("Invalid subindex '{raw_si}'")))?;
-    let single = u8::try_from(single_u16).map_err(|_| {
-        CliError::SscInvalidData(format!("Subindex {single_u16} exceeds 255 in '{raw_si}'"))
-    })?;
-    Ok(vec![single])
+    let single = parse_subindex_bound(t, raw_si)?;
+    Ok((vec![single], false))
+}
+
+fn format_subindex_template(raw: &str, si: u8, is_range: bool) -> String {
+    if raw.contains("{_SI_") {
+        let mut out = String::with_capacity(raw.len() + 4);
+        let mut rest = raw;
+        while let Some(start) = rest.find("{_SI_") {
+            out.push_str(&rest[..start]);
+            let after_prefix = &rest[start + 5..];
+            if let Some(end) = after_prefix.find('}') {
+                let spec = &after_prefix[..end];
+                let formatted = match spec {
+                    "" => format!("{si}"),
+                    ":X" => format!("{si:X}"),
+                    ":x" => format!("{si:x}"),
+                    ":X2" => format!("{si:02X}"),
+                    ":x2" => format!("{si:02x}"),
+                    ":X4" => format!("{si:04X}"),
+                    ":x4" => format!("{si:04x}"),
+                    ":D2" | ":d2" | ":02" => format!("{si:02}"),
+                    ":D3" | ":d3" | ":03" => format!("{si:03}"),
+                    _ => format!("{si}"),
+                };
+                out.push_str(&formatted);
+                rest = &after_prefix[end + 1..];
+            } else {
+                out.push_str("{_SI_");
+                rest = after_prefix;
+            }
+        }
+        out.push_str(rest);
+        return out;
+    }
+
+    if is_range {
+        if let Some(prefix) = raw.strip_suffix(" n") {
+            return format!("{prefix} {si}");
+        }
+    }
+    raw.to_string()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1043,14 +1237,32 @@ fn build_entry_from_table_cells(
     })
 }
 
-/// Parse `<EtherCATInfo>`, `<EtherCATDict>`, `<Dictionary>`, or `.esp` `<Application>` XML into `SlaveApplication`.
+/// Parse `<EtherCATInfo>`, `<EtherCATDict>`, `<Application>`, or GZIP/plain `.esp` `<SlaveConfiguratorProject>` into `SlaveApplication`.
 pub fn parse_xml_application(path: &Path) -> Result<SlaveApplication> {
-    let root = parse_dom_file(path, false)?;
+    let raw_bytes = read_gzip_or_plain(path)?;
+    let root = parse_dom_bytes(&raw_bytes, false)?;
     let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("Application")
         .to_string();
+    if root.local_name() == "SlaveConfiguratorProject" {
+        if let Some(app_el) = root.child("Application") {
+            return parse_application_from_dom(app_el, &stem);
+        }
+        let proj = SlaveProject::load(Some(path), None)?;
+        let od = build_project_object_dictionary(&proj, None)?;
+        let app_name = if od.name.is_empty() {
+            stem
+        } else {
+            od.name.clone()
+        };
+        let mut app = SlaveApplication::new(&app_name);
+        app.application_file_name = sanitize_file_name_keep_spaces(&app_name);
+        app.od = od;
+        sync_mdp_f000_into_app(&mut app);
+        return Ok(app);
+    }
     parse_application_from_dom(&root, &stem)
 }
 
@@ -1059,6 +1271,11 @@ pub fn parse_application_from_dom(
     default_name: &str,
 ) -> Result<SlaveApplication> {
     let root_name = root.local_name();
+    if root_name == "SlaveConfiguratorProject" {
+        if let Some(app_el) = root.child("Application") {
+            return parse_application_from_dom(app_el, default_name);
+        }
+    }
     if root_name == "EtherCATDict" {
         let mut app = SlaveApplication::new(default_name);
         app.application_file_name = sanitize_file_name_keep_spaces(default_name);
@@ -1950,4 +2167,456 @@ fn parse_tmc_application(path: &Path) -> Result<SlaveApplication> {
     }
 
     Ok(app)
+}
+
+fn csv_escape_cell(cell: &str) -> String {
+    if cell.contains(';') || cell.contains('"') || cell.contains('\r') || cell.contains('\n') {
+        format!("\"{}\"", cell.replace('"', "\"\""))
+    } else {
+        cell.to_string()
+    }
+}
+
+fn format_csv_row(cells: &[&str]) -> String {
+    cells
+        .iter()
+        .map(|c| csv_escape_cell(c))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn format_object_code_csv(code: ObjectCode) -> &'static str {
+    match code {
+        ObjectCode::Domain => "DOMAIN",
+        ObjectCode::Deftype => "DEFTYPE",
+        ObjectCode::Defstruct => "DEFSTRUCT",
+        ObjectCode::Variable => "VAR",
+        ObjectCode::Array => "ARRAY",
+        ObjectCode::Record => "RECORD",
+        ObjectCode::None => "",
+    }
+}
+
+fn format_category_csv(cat: ObjectCategory) -> &'static str {
+    match cat {
+        ObjectCategory::Mandatory => "m",
+        ObjectCategory::Optional => "o",
+        ObjectCategory::Conditional => "c",
+    }
+}
+
+fn format_bs_csv(flags: EntryFlags) -> &'static str {
+    match (flags.backup, flags.setting) {
+        (true, true) => "bs",
+        (true, false) => "b",
+        (false, true) => "s",
+        (false, false) => "",
+    }
+}
+
+fn format_access_csv(acc: AccessFlags) -> &'static str {
+    if acc == AccessFlags::RW {
+        "rw"
+    } else if acc == AccessFlags::RO {
+        "ro"
+    } else if acc == AccessFlags::WO {
+        "wo"
+    } else if acc == AccessFlags::RW_PREOP_RO_OTHER {
+        "rw-p"
+    } else if acc.all_read() && !acc.write_preop && acc.write_safeop && !acc.write_op {
+        "rw-s"
+    } else if acc.all_read() && !acc.write_preop && !acc.write_safeop && acc.write_op {
+        "rw-o"
+    } else if acc.all_read() && acc.write_preop && acc.write_safeop && !acc.write_op {
+        "rwps"
+    } else if acc.all_read() && acc.write_preop && !acc.write_safeop && acc.write_op {
+        "rwpo"
+    } else if acc.all_read() && !acc.write_preop && acc.write_safeop && acc.write_op {
+        "rwso"
+    } else if acc.any_write() && acc.any_read() {
+        "rw"
+    } else if acc.any_write() {
+        "wo"
+    } else {
+        "ro"
+    }
+}
+
+fn format_pdo_csv(mode: PdoMappingMode) -> &'static str {
+    match mode {
+        PdoMappingMode::None => "",
+        PdoMappingMode::Rx => "rx",
+        PdoMappingMode::Tx => "tx",
+        PdoMappingMode::RxOrTx => "rxtx",
+        PdoMappingMode::TxAndRx => "txrx",
+    }
+}
+
+fn format_entry_type_csv(entry: &EntryInfo) -> String {
+    if entry.data_type_id == 0 {
+        if entry.bit_length > 0 {
+            return format!("pad_{}", entry.bit_length);
+        }
+        return String::new();
+    }
+    let esi = create_esi_syntax_for_entry(entry);
+    if !esi.is_empty() {
+        return esi;
+    }
+    get_data_type(entry.data_type_id)
+        .map(|dt| dt.coe_name.to_string())
+        .unwrap_or_default()
+}
+
+fn format_hex_data_to_table_value(
+    data_type_id: u16,
+    hex_data: &str,
+    enum_val: Option<i32>,
+    is_enum_sub: bool,
+) -> String {
+    if is_enum_sub {
+        if let Some(ev) = enum_val {
+            return if ev < 0 {
+                ev.to_string()
+            } else {
+                format!("0x{ev:X}")
+            };
+        }
+    }
+    let trimmed = hex_data.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if data_type_id == 1 {
+        return if trimmed == "00" || trimmed == "0" {
+            "0".to_string()
+        } else {
+            "1".to_string()
+        };
+    }
+    let forward = reverse_hex_byte_pairs(trimmed);
+    if forward.is_empty() {
+        return String::new();
+    }
+    if data_type_id == 9 {
+        let mut decoded = Vec::with_capacity(forward.len() / 2);
+        let mut valid_hex = true;
+        for chunk in forward.as_bytes().chunks(2) {
+            if let Ok(s) = std::str::from_utf8(chunk) {
+                if let Ok(b) = u8::from_str_radix(s, 16) {
+                    decoded.push(b);
+                    continue;
+                }
+            }
+            valid_hex = false;
+            break;
+        }
+        if valid_hex && !decoded.is_empty() {
+            let printable = decoded.iter().all(|&b| (0x20..=0x7E).contains(&b))
+                && decoded.first() != Some(&b' ')
+                && decoded.last() != Some(&b' ');
+            if printable {
+                if let Ok(txt) = std::str::from_utf8(&decoded) {
+                    if !txt.starts_with("0x") && !txt.starts_with("0X") {
+                        return txt.to_string();
+                    }
+                }
+            }
+        }
+    }
+    format!("0x{forward}")
+}
+
+/// Export an `ObjectInfoCollection` back into a semicolon-delimited `.csv` Object Dictionary table
+/// compatible with `RawTableParser` / `SSC OD Tool` / `SSC Tool` (`OD_Tool` / GUI export parity).
+pub fn export_od_to_csv(od: &ObjectInfoCollection) -> String {
+    let has_extended_cols = od.objects.values().any(|obj| {
+        obj.entries
+            .iter()
+            .any(|e| e.unit.is_some() || !e.min_data.is_empty() || !e.max_data.is_empty())
+    });
+
+    let mut lines: Vec<String> = Vec::new();
+    let dp_str = od.device_profile.to_string();
+    let mp_str = od.module_profile.to_string();
+    let inc_str = if od.index_increment == 0 {
+        "0".to_string()
+    } else {
+        format!("0x{:X}", od.index_increment)
+    };
+    let pinc_str = if od.pdo_index_increment == 0 {
+        "0".to_string()
+    } else {
+        format!("0x{:X}", od.pdo_index_increment)
+    };
+
+    lines.push(format_csv_row(&[
+        "Device Profile:",
+        &dp_str,
+        &od.name,
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+    ]));
+    lines.push(format_csv_row(&[
+        "Modul Profile:",
+        &mp_str,
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+    ]));
+    lines.push(format_csv_row(&[
+        "IndexIncrement",
+        &inc_str,
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+    ]));
+    lines.push(format_csv_row(&[
+        "PdoIndexIncrement:",
+        &pinc_str,
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+    ]));
+    lines.push(String::new());
+
+    if has_extended_cols {
+        lines.push(
+            "Index;ObjectCode;SI;DataType;Name;Unit;Default Value;Min Value;Max Value;M/O/C;B/S;Access;rx/tx;CoeRead;CoeWrite;Description"
+                .to_string(),
+        );
+    } else {
+        lines.push(
+            "Index;ObjectCode;SI;DataType;Name;Default Value;M/O/C;B/S;Access;rx/tx;CoeRead;CoeWrite;Description"
+                .to_string(),
+        );
+    }
+
+    for obj in od.objects.values() {
+        let idx_str = format!("0x{:04X}", obj.index);
+        let code_str = format_object_code_csv(obj.object_code);
+        let moc_str = format_category_csv(obj.category);
+        let is_enum = obj.is_enum_object();
+
+        if obj.object_code == ObjectCode::Variable {
+            let e0 = obj.entry(0);
+            let dt_str = e0.map(format_entry_type_csv).unwrap_or_default();
+            let def_str = e0
+                .map(|e| {
+                    format_hex_data_to_table_value(
+                        e.data_type_id,
+                        &e.default_data,
+                        e.enum_value,
+                        false,
+                    )
+                })
+                .unwrap_or_default();
+            let unit_str = e0
+                .and_then(|e| e.unit)
+                .map(|u| format!("0x{u:X}"))
+                .unwrap_or_default();
+            let min_str = e0
+                .map(|e| format_hex_data_to_table_value(e.data_type_id, &e.min_data, None, false))
+                .unwrap_or_default();
+            let max_str = e0
+                .map(|e| format_hex_data_to_table_value(e.data_type_id, &e.max_data, None, false))
+                .unwrap_or_default();
+            let bs_str = e0.map(|e| format_bs_csv(e.flags)).unwrap_or("");
+            let acc_str = e0
+                .map(|e| format_access_csv(e.flags.access))
+                .unwrap_or("ro");
+            let pdo_str = e0
+                .map(|e| format_pdo_csv(e.flags.pdo_mapping))
+                .unwrap_or("");
+            let cread = e0
+                .filter(|e| !e.coe_read_callback.is_empty())
+                .map(|e| e.coe_read_callback.as_str())
+                .unwrap_or(&obj.coe_read_callback);
+            let cwrite = e0
+                .filter(|e| !e.coe_write_callback.is_empty())
+                .map(|e| e.coe_write_callback.as_str())
+                .unwrap_or(&obj.coe_write_callback);
+            let desc = e0
+                .filter(|e| !e.description.is_empty())
+                .map(|e| e.description.as_str())
+                .unwrap_or(&obj.description);
+
+            if has_extended_cols {
+                lines.push(format_csv_row(&[
+                    &idx_str, code_str, "", &dt_str, &obj.name, &unit_str, &def_str, &min_str,
+                    &max_str, moc_str, bs_str, acc_str, pdo_str, cread, cwrite, desc,
+                ]));
+            } else {
+                lines.push(format_csv_row(&[
+                    &idx_str, code_str, "", &dt_str, &obj.name, &def_str, moc_str, bs_str, acc_str,
+                    pdo_str, cread, cwrite, desc,
+                ]));
+            }
+            continue;
+        }
+
+        // ARRAY / RECORD / ENUM header row
+        let si0 = obj.entry(0);
+        let synthetic_si0 = si0.is_some_and(|e| e.name == "SubIndex 000" || is_enum);
+        let (hdr_bs, hdr_acc) = if synthetic_si0 {
+            if let Some(e0) = si0 {
+                let bs = format_bs_csv(e0.flags);
+                let acc = if e0.flags.access != AccessFlags::RO {
+                    format_access_csv(e0.flags.access)
+                } else {
+                    ""
+                };
+                (bs, acc)
+            } else {
+                ("", "")
+            }
+        } else {
+            ("", "")
+        };
+
+        if has_extended_cols {
+            lines.push(format_csv_row(&[
+                &idx_str,
+                code_str,
+                "",
+                "",
+                &obj.name,
+                "",
+                "",
+                "",
+                "",
+                moc_str,
+                hdr_bs,
+                hdr_acc,
+                "",
+                &obj.coe_read_callback,
+                &obj.coe_write_callback,
+                &obj.description,
+            ]));
+        } else {
+            lines.push(format_csv_row(&[
+                &idx_str,
+                code_str,
+                "",
+                "",
+                &obj.name,
+                "",
+                moc_str,
+                hdr_bs,
+                hdr_acc,
+                "",
+                &obj.coe_read_callback,
+                &obj.coe_write_callback,
+                &obj.description,
+            ]));
+        }
+
+        for entry in &obj.entries {
+            if entry.sub_index == 0 && synthetic_si0 {
+                continue;
+            }
+            let si_str = entry.sub_index.to_string();
+            let dt_str = format_entry_type_csv(entry);
+            let def_str = format_hex_data_to_table_value(
+                entry.data_type_id,
+                &entry.default_data,
+                entry.enum_value,
+                is_enum && entry.sub_index > 0,
+            );
+            let unit_str = entry.unit.map(|u| format!("0x{u:X}")).unwrap_or_default();
+            let min_str =
+                format_hex_data_to_table_value(entry.data_type_id, &entry.min_data, None, false);
+            let max_str =
+                format_hex_data_to_table_value(entry.data_type_id, &entry.max_data, None, false);
+            let e_moc = entry.category.map(format_category_csv).unwrap_or("");
+            let e_bs = format_bs_csv(entry.flags);
+            let e_acc = format_access_csv(entry.flags.access);
+            let e_pdo = format_pdo_csv(entry.flags.pdo_mapping);
+
+            if has_extended_cols {
+                lines.push(format_csv_row(&[
+                    "",
+                    "",
+                    &si_str,
+                    &dt_str,
+                    &entry.name,
+                    &unit_str,
+                    &def_str,
+                    &min_str,
+                    &max_str,
+                    e_moc,
+                    e_bs,
+                    e_acc,
+                    e_pdo,
+                    &entry.coe_read_callback,
+                    &entry.coe_write_callback,
+                    &entry.description,
+                ]));
+            } else {
+                lines.push(format_csv_row(&[
+                    "",
+                    "",
+                    &si_str,
+                    &dt_str,
+                    &entry.name,
+                    &def_str,
+                    e_moc,
+                    e_bs,
+                    e_acc,
+                    e_pdo,
+                    &entry.coe_read_callback,
+                    &entry.coe_write_callback,
+                    &entry.description,
+                ]));
+            }
+        }
+    }
+
+    let mut out = lines.join("\r\n");
+    out.push_str("\r\n");
+    out
+}
+
+/// Write an `ObjectInfoCollection` to disk as a `.csv` Object Dictionary file.
+pub fn write_od_to_csv(od: &ObjectInfoCollection, path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let csv_text = export_od_to_csv(od);
+    fs::write(path, csv_text.as_bytes())?;
+    Ok(())
 }

@@ -2512,6 +2512,8 @@ fn ssc_pure_rust_end_to_end_smoke() {
             offline_xml: Some(od_offline_xml.clone()),
             device_index: 0,
             overwrite_app: false,
+            force: false,
+            strict: false,
         },
     )))
     .expect("standalone ssc od generate from csv");
@@ -2613,7 +2615,7 @@ fn ssc_pure_rust_end_to_end_smoke() {
 
     let gen_out = tmp.join("gen_project");
     let sii_bin = gen_out.join("synth.bin");
-    handle_ssc(&SscSubcommand::Generate(SscGenerateArgs {
+    handle_ssc(&SscSubcommand::Generate(Box::new(SscGenerateArgs {
         project: Some(cfg_file.clone()),
         ssc_dir: Some(ssc_root.clone()),
         output: Some(gen_out.clone()),
@@ -2631,10 +2633,12 @@ fn ssc_pure_rust_end_to_end_smoke() {
         delete_comments: false,
         no_esp: false,
         no_esi: false,
+        esi_code_config: false,
+        esi_trace_file: None,
         sii_out: Some(sii_bin.clone()),
         strict_conflicts: true,
         ignore_errors: false,
-    }))
+    })))
     .expect("generate synthetic SSC project");
 
     let esp_out = gen_out.join("SynthProj.esp");
@@ -2983,6 +2987,8 @@ fn hardened_optimizations_and_edge_cases_regression() {
             offline_xml: None,
             device_index: 0,
             overwrite_app: false,
+            force: false,
+            strict: false,
         },
     )));
     let _ = std::fs::remove_file(&csv_tmp);
@@ -3013,4 +3019,457 @@ fn hardened_optimizations_and_edge_cases_regression() {
         .as_array()
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn ssc_full_decompilation_parity_suite() {
+    use crate::cli::{SscGenerateArgs, SscOdGenerateArgs, SscOdSubcommand, SscSubcommand};
+    use crate::commands::ssc::handle_ssc;
+    use ethercat_ssc::model::{
+        EsiFragment, EsiFragmentValue, FileFlags, SlaveFile, SlaveFileContent, SlaveFileType,
+        SlaveProject,
+    };
+    use ethercat_ssc::xml_dom::{DomElement, DomNode};
+
+    let tmp = std::env::temp_dir().join(format!("ecat-ssc-parity-{}", unique_temp_id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // -------------------------------------------------------------------------
+    // 1. Setup synthetic SSC 5.12 and SSC 5.13 trees (with <Migrations> & <SettingConflicts>)
+    // -------------------------------------------------------------------------
+    let ssc512_root = tmp.join("ssc_512");
+    let ssc513_root = tmp.join("ssc_513");
+    std::fs::create_dir_all(ssc512_root.join("cfg")).unwrap();
+    std::fs::create_dir_all(ssc512_root.join("src")).unwrap();
+    std::fs::create_dir_all(ssc513_root.join("cfg")).unwrap();
+    std::fs::create_dir_all(ssc513_root.join("src")).unwrap();
+
+    std::fs::write(
+        ssc512_root.join("src").join("ecatslv.c"),
+        "/**\r\n * \\version 5.12\r\n */\r\nint stack_ver = 512;\r\n",
+    )
+    .unwrap();
+    std::fs::write(
+        ssc513_root.join("src").join("ecatslv.c"),
+        "/**\r\n * \\version 5.13\r\n */\r\nint stack_ver = 513;\r\n",
+    )
+    .unwrap();
+
+    let cfg_512 = r##"<?xml version="1.0" encoding="utf-8"?>
+<SlaveCodeConfigurations ToolVersion="1.5.3.0" SSCVersion="5.12">
+  <Settings>
+    <Setting CodeDefine="VENDOR_ID" ValueType="hex" Value="0xE0000002" FileArea="Device">Vendor ID</Setting>
+    <Setting CodeDefine="VENDOR_NAME" ValueType="string" Value="Parity Vendor" FileArea="Device">Vendor Name</Setting>
+    <Setting CodeDefine="GROUP_NAME" ValueType="string" Value="Drives" FileArea="Device">Group Name</Setting>
+    <Setting CodeDefine="DEVICE_NAME" ValueType="string" Value="OldDrive512" FileArea="Device">Device Name</Setting>
+    <Setting CodeDefine="PRODUCT_CODE" ValueType="hex" Value="0x00005120" FileArea="Device">Product Code</Setting>
+    <Setting CodeDefine="REVISION_NUMBER" ValueType="hex" Value="0x00010000" FileArea="Device">Revision</Setting>
+    <Setting CodeDefine="LEGACY_TIMEOUT" ValueType="hex" Value="0x0064" FileArea="Mailbox">Legacy Timeout</Setting>
+    <Setting CodeDefine="MAILBOX_SUPPORTED" ValueType="bool" Value="1" FileArea="Mailbox"><Flags Evaluate="True" /></Setting>
+    <Setting CodeDefine="COE_SUPPORTED" ValueType="bool" Value="1" FileArea="CoE"><Flags Evaluate="True" /></Setting>
+    <Setting CodeDefine="DEF_MBX_SIZE" ValueType="hex" Value="0x0080" FileArea="Mailbox">Def Mbx</Setting>
+    <Setting CodeDefine="DEF_MBX_WRITE_ADDRESS" ValueType="hex" Value="0x1000" FileArea="Mailbox">Mbx Write</Setting>
+    <Setting CodeDefine="DEF_MBX_READ_ADDRESS" ValueType="hex" Value="0x1100" FileArea="Mailbox">Mbx Read</Setting>
+    <Setting CodeDefine="MIN_PD_WRITE_ADDRESS" ValueType="hex" Value="0x1200" FileArea="ProcessData">PD Write</Setting>
+    <Setting CodeDefine="DEF_PD_READ_ADDRESS" ValueType="hex" Value="0x1400" FileArea="ProcessData">PD Read</Setting>
+  </Settings>
+  <Files>
+    <File Name="ecatslv.c" Type="source" />
+  </Files>
+</SlaveCodeConfigurations>"##;
+    let cfg512_path = ssc512_root.join("cfg").join("SlaveConfigFile.xml");
+    std::fs::write(&cfg512_path, cfg_512).unwrap();
+
+    let cfg_513 = r##"<?xml version="1.0" encoding="utf-8"?>
+<SlaveCodeConfigurations ToolVersion="1.5.3.0" SSCVersion="5.13">
+  <Settings>
+    <Setting CodeDefine="VENDOR_ID" ValueType="hex" Value="0xE0000002" FileArea="Device">Vendor ID</Setting>
+    <Setting CodeDefine="VENDOR_NAME" ValueType="string" Value="Parity Vendor" FileArea="Device">Vendor Name</Setting>
+    <Setting CodeDefine="GROUP_NAME" ValueType="string" Value="Drives" FileArea="Device">Group Name</Setting>
+    <Setting CodeDefine="DEVICE_NAME" ValueType="string" Value="Default513" FileArea="Device">Device Name</Setting>
+    <Setting CodeDefine="PRODUCT_CODE" ValueType="hex" Value="0x00005130" FileArea="Device">Product Code</Setting>
+    <Setting CodeDefine="REVISION_NUMBER" ValueType="hex" Value="0x00020000" FileArea="Device">Revision</Setting>
+    <Setting CodeDefine="MBX_TIMEOUT" ValueType="hex" Value="0x0010" FileArea="Mailbox">Renamed Timeout</Setting>
+    <Setting CodeDefine="MAILBOX_SUPPORTED" ValueType="bool" Value="1" FileArea="Mailbox"><Flags Evaluate="True" /></Setting>
+    <Setting CodeDefine="COE_SUPPORTED" ValueType="bool" Value="1" FileArea="CoE"><Flags Evaluate="True" /></Setting>
+    <Setting CodeDefine="DEF_MBX_SIZE" ValueType="hex" Value="0x0080" FileArea="Mailbox">Def Mbx</Setting>
+    <Setting CodeDefine="DEF_MBX_WRITE_ADDRESS" ValueType="hex" Value="0x1000" FileArea="Mailbox">Mbx Write</Setting>
+    <Setting CodeDefine="DEF_MBX_READ_ADDRESS" ValueType="hex" Value="0x1100" FileArea="Mailbox">Mbx Read</Setting>
+    <Setting CodeDefine="MIN_PD_WRITE_ADDRESS" ValueType="hex" Value="0x1200" FileArea="ProcessData">PD Write</Setting>
+    <Setting CodeDefine="DEF_PD_READ_ADDRESS" ValueType="hex" Value="0x1400" FileArea="ProcessData">PD Read</Setting>
+  </Settings>
+  <Files>
+    <File Name="ecatslv.c" Type="source" />
+  </Files>
+  <SettingConflicts>
+    <SettingConflict Type="error" Define="COE_SUPPORTED" LinkedExpression="&amp;&amp; !MAILBOX_SUPPORTED">CoE requires Mailbox</SettingConflict>
+  </SettingConflicts>
+  <Migrations>
+    <Migration From="5.12" To="5.13">
+      <InterfaceChanges HwInterface="True" ApplInterface="False" />
+      <Settings>
+        <Setting Type="new" CodeDefine="MBX_TIMEOUT" ValueType="hex">
+          <DefaultValues>
+            <Value Expression="1" Value="[Key:LEGACY_TIMEOUT]" />
+          </DefaultValues>
+        </Setting>
+        <Setting Type="delete" CodeDefine="LEGACY_TIMEOUT" />
+      </Settings>
+    </Migration>
+  </Migrations>
+</SlaveCodeConfigurations>"##;
+    let cfg513_path = ssc513_root.join("cfg").join("SlaveConfigFile.xml");
+    std::fs::write(&cfg513_path, cfg_513).unwrap();
+
+    // -------------------------------------------------------------------------
+    // 2. OD_Reference inheritance, self-reference rejection, `.xlsm`, extended SI ranges
+    // -------------------------------------------------------------------------
+    let base_od_csv = tmp.join("BaseOd.csv");
+    std::fs::write(
+        &base_od_csv,
+        "Device Profile:;5001;BaseProfile;;;;;;;;;;\r\n\
+         Index;ObjectCode;SI;DataType;Name;Default Value;M/O/C;B/S;Access;rx/tx;CoeRead;CoeWrite;Description\r\n\
+         0x6000;RECORD;;;BaseInputs;;m;;;;;;Base sensor record\r\n\
+         ;;1;UINT16;BaseCh1;0x0011;m;;ro;tx;;;Base ch1\r\n\
+         ;;2;UINT16;BaseCh2;0x0022;o;;ro;tx;;;Base ch2\r\n",
+    )
+    .unwrap();
+
+    let derived_od_csv = tmp.join("DerivedOd.csv");
+    std::fs::write(
+        &derived_od_csv,
+        "Device Profile:;5001;DerivedApp;;;;;;;;;;\r\n\
+         OD_Reference:;(file: BaseOd.csv);;;;;;;;;;;\r\n\
+         Index;ObjectCode;SI;DataType;Name;Default Value;M/O/C;B/S;Access;rx/tx;CoeRead;CoeWrite;Description\r\n\
+         0x6000;RECORD;;;DerivedInputs;;m;;;;;;\r\n\
+         ;;1;UINT16;OverriddenCh1;0x0099;m;;ro;tx;;;\r\n\
+         0x7000;ARRAY;;;Outputs;;m;;;;;;\r\n\
+         ;;1\u{2026}3;UINT16;Out_{_SI_:X2};0x0000;m;;rw;rx;;;Channel {_SI_:D3}\r\n\
+         0x8000;ARRAY;;;Config;;o;;;;;;\r\n\
+         ;;0xnn+1...2;UINT8;Gain n;0x01;o;s;rw;;;;Param n\r\n",
+    )
+    .unwrap();
+
+    let parsed_derived = ethercat_ssc::od::parse_application_files(&[&derived_od_csv], false)
+        .expect("parse DerivedOd.csv with OD_Reference and extended subindex ranges");
+    let o6000 = parsed_derived.od.get(0x6000).expect("0x6000 present");
+    assert_eq!(o6000.entry(1).unwrap().name, "OverriddenCh1");
+    assert_eq!(
+        o6000.entry(2).unwrap().name,
+        "BaseCh2",
+        "SI 2 inherited from BaseOd.csv"
+    );
+    let o7000 = parsed_derived.od.get(0x7000).expect("0x7000 present");
+    assert_eq!(o7000.entry(1).unwrap().name, "Out_01");
+    assert_eq!(o7000.entry(3).unwrap().name, "Out_03");
+    assert_eq!(o7000.entry(3).unwrap().description, "Channel 003");
+    let o8000 = parsed_derived.od.get(0x8000).expect("0x8000 present");
+    assert_eq!(o8000.entry(1).unwrap().name, "Gain 1");
+    assert_eq!(o8000.entry(2).unwrap().description, "Param 2");
+
+    // Self-referencing OD_Reference must be rejected
+    let self_ref_csv = tmp.join("SelfRef.csv");
+    std::fs::write(
+        &self_ref_csv,
+        "OD_Reference:;(file: SelfRef.csv)\r\nIndex;ObjectCode;SI;DataType;Name\r\n0x2000;VAR;0;UINT16;Loop\r\n",
+    )
+    .unwrap();
+    assert!(
+        ethercat_ssc::od::parse_application_files(&[&self_ref_csv], false).is_err(),
+        "self OD_Reference cycle must fail"
+    );
+
+    // `.xlsm` extension support
+    let xlsm_path = tmp.join("MacroWorkbook.xlsm");
+    ethercat_ssc::od::write_xlsx_template(&xlsm_path).unwrap();
+    let xlsm_app =
+        ethercat_ssc::od::parse_application_files(&[&xlsm_path], false).expect("parse .xlsm OD");
+    assert!(xlsm_app.od.get(0xF000).is_some());
+
+    // -------------------------------------------------------------------------
+    // 3. `ssc generate --esi-code-config --esi-trace-file --raw-files` + `ssc import-esi` + `-c <dir>` + `ssc combine-esi`
+    // -------------------------------------------------------------------------
+    let gen_a_dir = tmp.join("gen_a");
+    handle_ssc(&SscSubcommand::Generate(Box::new(SscGenerateArgs {
+        project: Some(cfg513_path.clone()),
+        ssc_dir: Some(ssc513_root.clone()),
+        output: Some(gen_a_dir.clone()),
+        src_dir: None,
+        name: Some("DriveA".to_string()),
+        app: vec![derived_od_csv.clone()],
+        config: None,
+        config_name: None,
+        allow_file_import: false,
+        patch: None,
+        defines: vec![],
+        use_gui_options: false,
+        options_file: None,
+        raw_files: true,
+        delete_comments: false,
+        no_esp: false,
+        no_esi: false,
+        esi_code_config: true,
+        esi_trace_file: Some("traces\\drive_a.tct".to_string()),
+        sii_out: None,
+        strict_conflicts: false,
+        ignore_errors: false,
+    })))
+    .expect("generate DriveA with --esi-code-config and --raw-files");
+
+    let drive_a_esi = gen_a_dir.join("DriveA.xml");
+    let drive_a_esp = gen_a_dir.join("DriveA.esp");
+    let drive_a_ecat_def = gen_a_dir.join("src").join("ecat_def.h");
+    let esi_a_txt = std::fs::read_to_string(&drive_a_esi).unwrap();
+    assert!(
+        esi_a_txt.contains("<SSC>") && esi_a_txt.contains("CodeDefine")
+            || esi_a_txt.contains("<Setting"),
+        "ESI must embed <VendorSpecific><SSC><Settings>"
+    );
+    assert!(esi_a_txt.contains("traces\\drive_a.tct"));
+    let ecat_def_txt = std::fs::read_to_string(&drive_a_ecat_def).unwrap();
+    assert!(
+        ecat_def_txt.contains("#error \"CoE requires Mailbox\""),
+        "raw-files ecat_def.h must contain preprocessor conflict guard"
+    );
+
+    // Import settings from DriveA.xml via `ssc import-esi`
+    let imported_from_esi_esp = tmp.join("ImportedFromEsi.esp");
+    let imp_rep = handle_ssc(&SscSubcommand::ImportEsi {
+        esi: drive_a_esi.clone(),
+        device_index: 0,
+        project: Some(cfg513_path.clone()),
+        ssc_dir: Some(ssc513_root.clone()),
+        output: imported_from_esi_esp.clone(),
+        ignore_errors: true,
+    })
+    .expect("ssc import-esi");
+    assert!(imp_rep.json["imported_setting_count"].as_u64().unwrap_or(0) >= 5);
+    assert!(imported_from_esi_esp.is_file());
+
+    // Generate DriveB using `-c <config_dir>` directory scan and combine DriveA.xml + DriveB.xml
+    let ext_cfg_dir = tmp.join("ext_cfgs");
+    std::fs::create_dir_all(&ext_cfg_dir).unwrap();
+    handle_ssc(&SscSubcommand::ExportConfig {
+        project: Some(drive_a_esp.clone()),
+        ssc_dir: None,
+        defines: vec![
+            ("DEVICE_NAME".to_string(), "DriveB".to_string()),
+            ("PRODUCT_CODE".to_string(), "0x00009999".to_string()),
+        ],
+        name: "PresetDriveB".to_string(),
+        info: "Directory preset".to_string(),
+        output: ext_cfg_dir.join("preset_b.xml"),
+    })
+    .unwrap();
+
+    let gen_b_dir = tmp.join("gen_b");
+    handle_ssc(&SscSubcommand::Generate(Box::new(SscGenerateArgs {
+        project: Some(cfg513_path.clone()),
+        ssc_dir: Some(ssc513_root.clone()),
+        output: Some(gen_b_dir.clone()),
+        src_dir: None,
+        name: Some("DriveB".to_string()),
+        app: vec![],
+        config: Some(ext_cfg_dir.clone()),
+        config_name: Some("PresetDriveB".to_string()),
+        allow_file_import: false,
+        patch: None,
+        defines: vec![],
+        use_gui_options: false,
+        options_file: None,
+        raw_files: false,
+        delete_comments: false,
+        no_esp: true,
+        no_esi: false,
+        esi_code_config: false,
+        esi_trace_file: None,
+        sii_out: None,
+        strict_conflicts: false,
+        ignore_errors: false,
+    })))
+    .expect("generate DriveB from -c <config_dir>");
+
+    let drive_b_esi = gen_b_dir.join("DriveB.xml");
+    let combined_esi = tmp.join("CombinedCatalog.xml");
+    let comb1 = handle_ssc(&SscSubcommand::CombineEsi {
+        inputs: vec![drive_a_esi.clone(), drive_b_esi.clone()],
+        output: combined_esi.clone(),
+    })
+    .expect("combine DriveA.xml and DriveB.xml");
+    assert_eq!(comb1.json["device_count"], 2);
+    assert_eq!(
+        comb1.json["group_count"], 1,
+        "identical <Group><Type>Drives</Type> deduplicated"
+    );
+
+    // Overwriting CombinedCatalog.xml must create CombinedCatalog.xml.bak
+    let comb2 = handle_ssc(&SscSubcommand::CombineEsi {
+        inputs: vec![drive_a_esi.clone(), drive_b_esi.clone()],
+        output: combined_esi.clone(),
+    })
+    .expect("combine-esi overwrite with .bak");
+    assert!(comb2.json["backup_file"].is_string());
+    assert!(tmp.join("CombinedCatalog.xml.bak").is_file());
+
+    // -------------------------------------------------------------------------
+    // 4. `ssc migrate` (`AdaptProject` parity: 5.12 -> 5.13 with Migration rename, user file, fragment, OD, skipped patch)
+    // -------------------------------------------------------------------------
+    let mut old_proj = SlaveProject::load(Some(&cfg512_path), Some(&ssc512_root)).unwrap();
+    old_proj
+        .set_setting_value("LEGACY_TIMEOUT", "0x01F4", false, true, true)
+        .unwrap();
+    ethercat_ssc::od::build_application_slave_files(&parsed_derived);
+    old_proj.application_xml = Some(parsed_derived.to_esp_xml_element());
+    for sf in ethercat_ssc::od::build_application_slave_files(&parsed_derived) {
+        old_proj.files.push(sf);
+    }
+    old_proj.files.push(SlaveFile {
+        name: "board_hal.c".to_string(),
+        file_type: SlaveFileType::Source,
+        version: "1.0".to_string(),
+        expression: String::new(),
+        flags: FileFlags {
+            user_file: true,
+            hw_file: true,
+            appl_file: false,
+        },
+        content: SlaveFileContent::TextLines(vec!["int hal_ok = 1;".to_string()]),
+    });
+    old_proj.files.push(SlaveFile {
+        name: "old_512.patch".to_string(),
+        file_type: SlaveFileType::Patch,
+        version: String::new(),
+        expression: String::new(),
+        flags: FileFlags::default(),
+        content: SlaveFileContent::TextLines(vec!["--- a/ecatslv.c".to_string()]),
+    });
+    old_proj.esi_fragments.push(EsiFragment {
+        path: "./Descriptions/Devices/Device".to_string(),
+        user_specific: true,
+        comment: Some("UserCustomNote".to_string()),
+        values: vec![EsiFragmentValue {
+            active_expression: String::new(),
+            nodes: vec![DomNode::Element(DomElement::with_text("Physics", "YY"))],
+        }],
+    });
+    let old_esp_path = tmp.join("Old512.esp");
+    old_proj.save_esp(&old_esp_path).unwrap();
+
+    let migrated_esp_path = tmp.join("Migrated513.esp");
+    let mig_rep = handle_ssc(&SscSubcommand::Migrate {
+        project: old_esp_path.clone(),
+        target_ssc: Some(cfg513_path.clone()),
+        ssc_dir: Some(ssc513_root.clone()),
+        output: migrated_esp_path.clone(),
+        ignore_errors: false,
+    })
+    .expect("migrate 5.12 .esp to 5.13");
+    assert_eq!(mig_rep.json["report"]["from_ssc_version"], "5.12");
+    assert_eq!(mig_rep.json["report"]["to_ssc_version"], "5.13");
+    assert_eq!(mig_rep.json["report"]["hw_interface_changed"], true);
+    assert_eq!(mig_rep.json["preserved_application"], true);
+    assert_eq!(mig_rep.json["report"]["preserved_esi_fragments"], 1);
+    assert!(
+        !mig_rep.json["report"]["warnings"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "migration must warn about hw_interface_changed and skipped cross-version patch"
+    );
+
+    let reloaded_mig = SlaveProject::load(Some(&migrated_esp_path), None).unwrap();
+    assert_eq!(reloaded_mig.ssc_version, "5.13");
+    assert_eq!(
+        reloaded_mig.get_setting_value("MBX_TIMEOUT"),
+        Some("0x01F4")
+    );
+    assert!(reloaded_mig.files.iter().any(|f| f.name == "board_hal.c"));
+    assert!(!reloaded_mig
+        .files
+        .iter()
+        .any(|f| f.file_type == SlaveFileType::Patch));
+
+    // -------------------------------------------------------------------------
+    // 5. `.esp` GZIP OD export (`ssc od export`) + `ssc od check` + `ssc od generate --force` & `<InputDir>/output` default
+    // -------------------------------------------------------------------------
+    let exported_csv = tmp.join("ExportedFromEsp.csv");
+    let exp_od_rep = handle_ssc(&SscSubcommand::Od(SscOdSubcommand::Export {
+        input: migrated_esp_path.clone(),
+        output: exported_csv.clone(),
+        worksheet: None,
+    }))
+    .expect("export OD from GZIP .esp to .csv");
+    assert!(exp_od_rep.json["object_count"].as_u64().unwrap_or(0) >= 5);
+    let roundtrip_app = ethercat_ssc::od::parse_application_files(&[&exported_csv], false)
+        .expect("re-parse exported CSV");
+    assert_eq!(
+        roundtrip_app.od.get(0x6000).unwrap().entry(1).unwrap().name,
+        "OverriddenCh1"
+    );
+
+    // Invalid MDP 5001 OD (`0x6000` mapped as `rx` instead of `tx`):
+    let bad_od_dir = tmp.join("bad_od_case");
+    std::fs::create_dir_all(&bad_od_dir).unwrap();
+    let bad_od_csv = bad_od_dir.join("BadMdp.csv");
+    std::fs::write(
+        &bad_od_csv,
+        "Device Profile:;5001;BadMdpApp;;;;;;;;;;\r\n\
+         Index;ObjectCode;SI;DataType;Name;Default Value;M/O/C;B/S;Access;rx/tx;CoeRead;CoeWrite;Description\r\n\
+         0x6000;VAR;0;UINT16;WrongDirInput;0x0000;m;;rw;rx;;;\r\n\
+         0x7000;VAR;0;UINT16;ValidOutput;0x0000;m;;rw;rx;;;\r\n",
+    )
+    .unwrap();
+
+    assert!(
+        handle_ssc(&SscSubcommand::Od(SscOdSubcommand::Check {
+            inputs: vec![bad_od_csv.clone()],
+            worksheet: None,
+            strict: true,
+        }))
+        .is_err(),
+        "ssc od check must reject MDP 0x6000 mapped as Rx"
+    );
+    assert!(
+        handle_ssc(&SscSubcommand::Od(SscOdSubcommand::Generate(
+            SscOdGenerateArgs {
+                inputs: vec![bad_od_csv.clone()],
+                worksheet: None,
+                src_dir: None,
+                esi: None,
+                offline_xml: None,
+                device_index: 0,
+                overwrite_app: false,
+                force: false,
+                strict: true,
+            }
+        )))
+        .is_err(),
+        "ssc od generate without --force must reject invalid MDP object"
+    );
+
+    let forced_rep = handle_ssc(&SscSubcommand::Od(SscOdSubcommand::Generate(
+        SscOdGenerateArgs {
+            inputs: vec![bad_od_csv.clone()],
+            worksheet: None,
+            src_dir: None,
+            esi: None,
+            offline_xml: None,
+            device_index: 0,
+            overwrite_app: false,
+            force: true,
+            strict: true,
+        },
+    )))
+    .expect("ssc od generate --force must skip invalid 0x6000 and succeed");
+    assert_eq!(forced_rep.json["skipped_invalid_objects"][0], "0x6000");
+    // Since `bad_od_dir/Src` did NOT exist, default C output folder must be `bad_od_dir/output`!
+    assert!(
+        bad_od_dir
+            .join("output")
+            .join("BadMdpAppObjects.h")
+            .is_file(),
+        "default src_dir must fall back to <InputDir>/output when <InputDir>/Src does not exist"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
 }

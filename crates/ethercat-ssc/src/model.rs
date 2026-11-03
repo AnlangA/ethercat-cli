@@ -689,9 +689,24 @@ pub struct SscToolOptions {
     pub apply_default_patch_on_new_projects: Option<bool>,
     pub default_patch_file: Option<PathBuf>,
     pub add_delete_comment: bool,
+    pub add_code_config_to_esi: bool,
     pub block_mismatching_values: bool,
     pub dependent_setting_change_apply_all: bool,
     pub external_configuration_files: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectAdaptReport {
+    pub from_ssc_version: String,
+    pub to_ssc_version: String,
+    pub traversed_versions: Vec<String>,
+    pub hw_interface_changed: bool,
+    pub appl_interface_changed: bool,
+    pub migrated_setting_count: usize,
+    pub preserved_user_files: Vec<String>,
+    pub skipped_patch_files: Vec<String>,
+    pub preserved_esi_fragments: usize,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1135,6 +1150,38 @@ impl SlaveProject {
         active
     }
 
+    /// Render C preprocessor `#if ... #error/#warning ... #endif` blocks for `ecat_def.h`
+    /// when exporting un-preprocessed raw slave files (`SettingConflict::GetSourceCode` parity).
+    pub fn render_conflict_directives(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for c in &self.conflicts {
+            if c.tool_only || c.combined_expression.trim().is_empty() {
+                continue;
+            }
+            let directive = match c.severity {
+                ConflictSeverity::Error => "#error",
+                ConflictSeverity::Warning => "#warning",
+                ConflictSeverity::None | ConflictSeverity::Info => continue,
+            };
+            let clean_msg: String = c
+                .message
+                .lines()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            out.push(format!("#if ({})", c.combined_expression.trim()));
+            if clean_msg.is_empty() {
+                out.push(format!("{directive} Invalid SSC configuration"));
+            } else {
+                out.push(format!("{directive} \"{clean_msg}\""));
+            }
+            out.push("#endif".to_string());
+            out.push(String::new());
+        }
+        out
+    }
+
     /// Evaluate `UpdateInformation.xml` known issues matching this project's `SSCVersion` and active settings.
     pub fn evaluate_known_issues(&self, custom_path: Option<&Path>) -> Result<Vec<KnownIssue>> {
         let path = match custom_path {
@@ -1515,12 +1562,29 @@ impl SlaveProject {
             };
 
             for rule in &mig.rules {
-                if rule.rule_type.eq_ignore_ascii_case("new") {
-                    if map.contains_key(&rule.code_define) {
+                if rule.rule_type.eq_ignore_ascii_case("new")
+                    || rule.rule_type.eq_ignore_ascii_case("change")
+                {
+                    if rule.rule_type.eq_ignore_ascii_case("new")
+                        && map.contains_key(&rule.code_define)
+                    {
                         continue;
                     }
-                    let evaluated =
+                    let mut evaluated =
                         eval_migration_defaults(&rule.default_values, &map, &self.settings);
+                    let wants_hex = rule.value_type.eq_ignore_ascii_case("hex")
+                        || self
+                            .get_setting(&rule.code_define)
+                            .is_some_and(|s| matches!(s.value_type, SettingValueType::Hex { .. }));
+                    if wants_hex
+                        && !evaluated.is_empty()
+                        && !evaluated.starts_with("0x")
+                        && !evaluated.starts_with("0X")
+                    {
+                        if let Ok(n) = evaluated.parse::<u64>() {
+                            evaluated = format!("0x{n:04X}");
+                        }
+                    }
                     map.insert(
                         rule.code_define.clone(),
                         ExternalConfigSetting {
@@ -1548,6 +1612,197 @@ impl SlaveProject {
             out.push(remaining);
         }
         Ok(out)
+    }
+
+    /// Adapt/migrate an existing `.esp` `SlaveProject` (`old`) onto this newer SSC base `SlaveProject`
+    /// (`SlaveProject::AdaptProject` / `SSC Tool` `File -> Adapt Project to new SSC...` parity).
+    pub fn adapt_from(
+        &mut self,
+        old: &SlaveProject,
+        ignore_errors: bool,
+    ) -> Result<ProjectAdaptReport> {
+        let mut traversed_versions = vec![old.ssc_version.clone()];
+        let mut hw_interface_changed = false;
+        let mut appl_interface_changed = false;
+
+        if old.ssc_version != self.ssc_version {
+            let mut cur = old.ssc_version.clone();
+            let mut steps = 0usize;
+            while cur != self.ssc_version && steps < 32 {
+                steps += 1;
+                if let Some(mig) = self.migrations.iter().find(|m| m.from_version == cur) {
+                    hw_interface_changed |= mig.hw_interface_changed;
+                    appl_interface_changed |= mig.appl_interface_changed;
+                    if !mig.info.trim().is_empty() {
+                        self.warnings.push(format!(
+                            "Migration {} -> {}: {}",
+                            mig.from_version,
+                            mig.to_version,
+                            mig.info.trim()
+                        ));
+                    }
+                    cur = mig.to_version.clone();
+                    traversed_versions.push(cur.clone());
+                } else {
+                    break;
+                }
+            }
+        }
+
+        if hw_interface_changed {
+            self.warnings.push(
+                "Hardware interface changed during SSC migration; review custom hardware files."
+                    .to_string(),
+            );
+        }
+        if appl_interface_changed {
+            self.warnings.push(
+                "Application interface changed during SSC migration; review custom application callbacks."
+                    .to_string(),
+            );
+        }
+
+        let old_cfg_settings: Vec<ExternalConfigSetting> = old
+            .settings
+            .iter()
+            .filter(|s| !s.flags.read_only.is_true())
+            .map(|s| ExternalConfigSetting {
+                code_define: s.code_define.clone(),
+                value: Some(s.value.clone()),
+                visible_flag: match s.flags.visible {
+                    Tristate::True => Some(true),
+                    Tristate::False => Some(false),
+                    Tristate::Null => None,
+                },
+            })
+            .collect();
+
+        let effective_settings = if old.ssc_version == self.ssc_version {
+            old_cfg_settings
+        } else {
+            self.migrate_configuration_settings(&old.ssc_version, &old_cfg_settings, ignore_errors)?
+        };
+
+        let mut migrated_setting_count = 0usize;
+        let mut missing_defines = Vec::new();
+        for cs in &effective_settings {
+            if let Some(&idx) = self.setting_index.get(&cs.code_define) {
+                if let Some(val) = &cs.value {
+                    self.set_setting_value(&cs.code_define, val, false, !ignore_errors, true)?;
+                    if !self.settings[idx].flags.read_only.is_true() {
+                        self.settings[idx].clear_default_values();
+                    }
+                    migrated_setting_count += 1;
+                }
+                if let Some(vis) = cs.visible_flag {
+                    self.settings[idx].flags.visible =
+                        if vis { Tristate::True } else { Tristate::False };
+                }
+            } else {
+                missing_defines.push(cs.code_define.clone());
+            }
+        }
+        if !missing_defines.is_empty() {
+            let msg = format!(
+                "Adapted project contained obsolete/unknown settings: {}",
+                missing_defines.join(", ")
+            );
+            if ignore_errors {
+                self.warnings.push(msg);
+            } else {
+                return Err(CliError::Validation(msg));
+            }
+        }
+
+        if !old.source_code_output_dir.is_empty() {
+            self.source_code_output_dir = old.source_code_output_dir.clone();
+        }
+        if !old.esi_output_dir.is_empty() {
+            self.esi_output_dir = old.esi_output_dir.clone();
+        }
+
+        // Preserve user-specific ESI fragments
+        let mut preserved_esi_fragments = 0usize;
+        for frag in old.esi_fragments.iter().filter(|f| f.user_specific) {
+            preserved_esi_fragments += 1;
+            if let Some(existing) = self.esi_fragments.iter_mut().find(|e| e.path == frag.path) {
+                *existing = frag.clone();
+            } else {
+                self.esi_fragments.push(frag.clone());
+            }
+        }
+
+        // Preserve embedded `<Application>` OD if present, regenerating `*Objects.h`
+        if let Some(app_el) = &old.application_xml {
+            let fallback_name = self
+                .get_setting_value("DEVICE_NAME")
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Application")
+                .to_string();
+            if let Ok(mut app) =
+                crate::od::parsers::parse_application_from_dom(app_el, &fallback_name)
+            {
+                app.od.finalize_and_validate(false);
+                for m in &mut app.modules {
+                    m.od.finalize_and_validate(false);
+                }
+                let gen_files = crate::od::build_application_slave_files(&app);
+                self.apply_imported_application(
+                    &app.name,
+                    &app.application_file_name,
+                    app.get_process_data_length_bytes(0x1C12),
+                    app.od.contains(0x1C12),
+                    app.get_process_data_length_bytes(0x1C13),
+                    app.od.contains(0x1C13),
+                    app.od.module_profile,
+                    app.od.device_profile,
+                    gen_files,
+                    app_el.clone(),
+                )?;
+            } else {
+                self.application_xml = Some(app_el.clone());
+            }
+        }
+
+        // Preserve user files (`UserFile="true"`), skipping `.patch` if SSC version changed
+        let mut preserved_user_files = Vec::new();
+        let mut skipped_patch_files = Vec::new();
+        let same_ver = old.ssc_version == self.ssc_version;
+        for uf in old.files.iter().filter(|f| f.flags.user_file) {
+            if uf.file_type == SlaveFileType::Patch && !same_ver {
+                skipped_patch_files.push(uf.name.clone());
+                self.warnings.push(format!(
+                    "Skipped patch '{}' from SSC {} when adapting to SSC {}",
+                    uf.name, old.ssc_version, self.ssc_version
+                ));
+                continue;
+            }
+            if let Some(pos) = self
+                .files
+                .iter()
+                .position(|existing| existing.name.eq_ignore_ascii_case(&uf.name))
+            {
+                self.files[pos] = uf.clone();
+            } else {
+                self.files.push(uf.clone());
+            }
+            preserved_user_files.push(uf.name.clone());
+        }
+
+        self.is_project_file = true;
+
+        Ok(ProjectAdaptReport {
+            from_ssc_version: old.ssc_version.clone(),
+            to_ssc_version: self.ssc_version.clone(),
+            traversed_versions,
+            hw_interface_changed,
+            appl_interface_changed,
+            migrated_setting_count,
+            preserved_user_files,
+            skipped_patch_files,
+            preserved_esi_fragments,
+            warnings: self.warnings.clone(),
+        })
     }
 
     /// Serialize this project to a `DomElement` (`<SlaveConfiguratorProject>` when `as_project_esp == true`,
@@ -2299,9 +2554,46 @@ fn parse_configuration_element(
     }
 }
 
-/// Load external configurations from `.xml` (`<SscToolConfiguration>` or `<SlaveCodeConfigurations>`),
-/// `.escfg`, `.esp`, or `.h` (`ecat_def.h` `#define` import), matching `SscToolConfiguration::Load`.
+/// Load external configurations from `.xml` (`<SscToolConfiguration>`, `<SlaveCodeConfigurations>`,
+/// or `<EtherCATInfo>` ESI XML), a directory of `*.xml` configuration files, `.escfg`, `.esp`,
+/// or `.h` (`ecat_def.h` `#define` import), matching `SscToolConfiguration::Load` + `ConfigurationCollection::GetConfigurations`.
 pub fn load_external_configurations(path: &Path) -> Result<Vec<ExternalConfiguration>> {
+    if path.is_dir() {
+        let mut entries: Vec<PathBuf> = fs::read_dir(path)
+            .map_err(|e| {
+                CliError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "cannot read configuration directory '{}': {e}",
+                        path.display()
+                    ),
+                ))
+            })?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && p.extension().and_then(|x| x.to_str()).is_some_and(|x| {
+                        x.eq_ignore_ascii_case("xml") || x.eq_ignore_ascii_case("escfg")
+                    })
+            })
+            .collect();
+        entries.sort();
+        let mut combined = Vec::new();
+        for file_path in entries {
+            if let Ok(cfgs) = load_external_configurations(&file_path) {
+                combined.extend(cfgs);
+            }
+        }
+        if combined.is_empty() {
+            return Err(CliError::Format(format!(
+                "No valid SSC <Configuration> files found in directory '{}'",
+                path.display()
+            )));
+        }
+        return Ok(combined);
+    }
+
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -2314,6 +2606,11 @@ pub fn load_external_configurations(path: &Path) -> Result<Vec<ExternalConfigura
 
     let xml_bytes = read_gzip_or_plain(path)?;
     let root = parse_dom_bytes(&xml_bytes, false)?;
+
+    if root.local_name() == "EtherCATInfo" {
+        return import_configurations_from_esi_dom(&root, Some(path));
+    }
+
     let ssc_version = root
         .attr("SSCVersion")
         .map(get_clear_value)
@@ -2379,6 +2676,468 @@ pub fn load_external_configurations(path: &Path) -> Result<Vec<ExternalConfigura
             "No <Configuration> entries found in '{}'",
             path.display()
         )));
+    }
+    Ok(out)
+}
+
+/// Import SSC settings from an ETG.2000 `<EtherCATInfo>` ESI `.xml` file
+/// (`SlaveSetting::ParseESI` + `<VendorSpecific><SSC><Settings>` parity).
+pub fn import_settings_from_esi_xml(
+    esi_path: &Path,
+    device_index: usize,
+) -> Result<ExternalConfiguration> {
+    let xml_bytes = read_gzip_or_plain(esi_path)?;
+    let root = parse_dom_bytes(&xml_bytes, false)?;
+    if root.local_name() != "EtherCATInfo" {
+        return Err(CliError::Format(format!(
+            "Expected <EtherCATInfo> root in '{}', found '<{}>'",
+            esi_path.display(),
+            root.name
+        )));
+    }
+    let mut cfgs = import_configurations_from_esi_dom(&root, Some(esi_path))?;
+    if device_index >= cfgs.len() {
+        return Err(CliError::Validation(format!(
+            "Device index {device_index} out of range ('{}' has {} <Device> element(s))",
+            esi_path.display(),
+            cfgs.len()
+        )));
+    }
+    Ok(cfgs.swap_remove(device_index))
+}
+
+fn import_configurations_from_esi_dom(
+    root: &DomElement,
+    source_path: Option<&Path>,
+) -> Result<Vec<ExternalConfiguration>> {
+    let vendor_el = root.child("Vendor");
+    let raw_vid = vendor_el
+        .and_then(|v| v.child_text("Id"))
+        .unwrap_or_default();
+    let vendor_id = parse_setting_u32(&raw_vid)
+        .map(|v| format!("0x{v:08X}"))
+        .unwrap_or_default();
+    let vendor_name = vendor_el
+        .and_then(|v| v.child_text("Name"))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let vendor_img = vendor_el
+        .and_then(|v| v.child_text("ImageData16x14"))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    let desc_el = root.child("Descriptions");
+    let mut group_images: BTreeMap<String, (String, String)> = BTreeMap::new();
+    if let Some(groups_el) = desc_el.and_then(|d| d.child("Groups")) {
+        for g in groups_el.children_named("Group") {
+            let g_type = g.child_text("Type").unwrap_or_default().trim().to_string();
+            let g_name = g
+                .child_text("Name")
+                .unwrap_or_else(|| g_type.clone())
+                .trim()
+                .to_string();
+            let g_img = g
+                .child_text("ImageData16x14")
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if !g_type.is_empty() {
+                group_images.insert(g_type, (g_name, g_img));
+            }
+        }
+    }
+
+    let Some(devs_el) = desc_el.and_then(|d| d.child("Devices")) else {
+        return Err(CliError::Format(
+            "ESI XML contains no <Descriptions>/<Devices> section".into(),
+        ));
+    };
+
+    let mut out = Vec::new();
+    for (dev_idx, dev_el) in devs_el.children_named("Device").enumerate() {
+        let mut map: BTreeMap<String, String> = BTreeMap::new();
+        let mut order: Vec<String> = Vec::new();
+        let mut set_kv = |key: &str, val: String| {
+            if !map.contains_key(key) {
+                order.push(key.to_string());
+            }
+            map.insert(key.to_string(), val);
+        };
+
+        if !vendor_id.is_empty() {
+            set_kv("VENDOR_ID", vendor_id.clone());
+        }
+        if !vendor_name.is_empty() {
+            set_kv("VENDOR_NAME", vendor_name.clone());
+        }
+        if !vendor_img.is_empty() {
+            set_kv("VENDOR_IMAGE", vendor_img.clone());
+        }
+
+        let type_el = dev_el.child("Type");
+        let type_text = type_el
+            .map(|t| t.inner_text().trim().to_string())
+            .unwrap_or_default();
+        let dev_name = dev_el
+            .child_text("Name")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                if !type_text.is_empty() {
+                    type_text.clone()
+                } else {
+                    format!("Device_{dev_idx}")
+                }
+            });
+        set_kv("DEVICE_NAME", dev_name.clone());
+
+        if let Some(te) = type_el {
+            if let Some(pc) = te
+                .attr("ProductCode")
+                .and_then(|s| parse_setting_u32(s).ok())
+            {
+                set_kv("PRODUCT_CODE", format!("0x{pc:08X}"));
+            }
+            if let Some(rev) = te
+                .attr("RevisionNo")
+                .and_then(|s| parse_setting_u32(s).ok())
+            {
+                set_kv("REVISION_NUMBER", format!("0x{rev:08X}"));
+            }
+        }
+
+        if let Some(gt) = dev_el.child_text("GroupType") {
+            let gt_trim = gt.trim();
+            if !gt_trim.is_empty() {
+                if let Some((_, g_img)) = group_images.get(gt_trim) {
+                    set_kv("GROUP_NAME", gt_trim.to_string());
+                    if !g_img.is_empty() {
+                        set_kv("GROUP_IMAGE", g_img.clone());
+                    }
+                } else {
+                    set_kv("GROUP_NAME", gt_trim.to_string());
+                }
+            }
+        }
+
+        if let Some(d_img) = dev_el.child_text("ImageData16x14") {
+            let t = d_img.trim();
+            if !t.is_empty() {
+                set_kv("DEVICE_IMAGE", t.to_string());
+            }
+        }
+
+        if let Some(info_el) = dev_el.child("Info") {
+            if let Some(to_el) = info_el
+                .child("StateMachine")
+                .and_then(|sm| sm.child("Timeout"))
+            {
+                if let Some(pre) = to_el
+                    .child_text("PreopTimeout")
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                {
+                    set_kv("PREOPTIMEOUT", format!("0x{pre:X}"));
+                }
+                if let Some(so) = to_el
+                    .child_text("SafeopOpTimeout")
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                {
+                    set_kv("SAFEOP2OPTIMEOUT", format!("0x{so:X}"));
+                }
+            }
+            if let Some(id134) = info_el.child_text("IdentificationReg134") {
+                let b = id134.trim() == "1" || id134.trim().eq_ignore_ascii_case("true");
+                set_kv("EXPLICIT_DEVICE_ID", if b { "1" } else { "0" }.to_string());
+            }
+        }
+
+        if let Some(prof_el) = dev_el.child("Profile") {
+            let prof_no = prof_el
+                .child_text("ProfileNo")
+                .or_else(|| {
+                    prof_el
+                        .child("ChannelInfo")
+                        .and_then(|ci| ci.child_text("ProfileNo"))
+                })
+                .and_then(|s| parse_setting_u16(&s).ok())
+                .unwrap_or(0);
+            let add_info = prof_el
+                .child_text("AddInfo")
+                .or_else(|| {
+                    prof_el
+                        .child("ChannelInfo")
+                        .and_then(|ci| ci.child_text("AddInfo"))
+                })
+                .and_then(|s| parse_setting_u16(&s).ok())
+                .unwrap_or(0);
+            if prof_no != 0 || add_info != 0 {
+                let combined = ((add_info as u32) << 16) | (prof_no as u32);
+                set_kv("DEVICE_PROFILE_TYPE", format!("0x{combined:08X}"));
+            }
+            if prof_el.child("DiagMessages").is_some() {
+                set_kv("DIAGNOSIS_SUPPORTED", "1".to_string());
+            }
+            if let Some(objs_el) = prof_el.child("Dictionary").and_then(|d| d.child("Objects")) {
+                for obj in objs_el.children_named("Object") {
+                    let Some(idx) = obj
+                        .child_text("Index")
+                        .and_then(|s| parse_setting_u16(&s).ok())
+                    else {
+                        continue;
+                    };
+                    if idx == 0x1009 || idx == 0x100A {
+                        if let Some(inf) = obj.child("Info") {
+                            let decoded = if let Some(ds) = inf.child_text("DefaultString") {
+                                Some(ds)
+                            } else if let Some(dd) = inf.child_text("DefaultData") {
+                                let raw_bytes = parse_setting_bytes(&dd);
+                                let end = raw_bytes
+                                    .iter()
+                                    .position(|&b| b == 0)
+                                    .unwrap_or(raw_bytes.len());
+                                String::from_utf8(raw_bytes[..end].to_vec()).ok()
+                            } else {
+                                None
+                            };
+                            if let Some(ver_str) = decoded.filter(|s| !s.is_empty()) {
+                                if idx == 0x1009 {
+                                    set_kv("DEVICE_HW_VERSION", ver_str);
+                                } else {
+                                    set_kv("DEVICE_SW_VERSION", ver_str);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // SyncManagers
+        for sm in dev_el.children_named("Sm") {
+            let role = sm.text_content();
+            let start_opt = sm
+                .attr("StartAddress")
+                .and_then(|s| parse_setting_u16(s).ok());
+            let min_opt = sm.attr("MinSize").and_then(|s| parse_setting_u16(s).ok());
+            let max_opt = sm.attr("MaxSize").and_then(|s| parse_setting_u16(s).ok());
+            let def_opt = sm
+                .attr("DefaultSize")
+                .and_then(|s| parse_setting_u16(s).ok());
+            match role.trim() {
+                "MBoxOut" => {
+                    if let Some(st) = start_opt {
+                        set_kv("DEF_MBX_WRITE_ADDRESS", format!("0x{st:04X}"));
+                    }
+                    if let Some(mn) = min_opt {
+                        set_kv("MIN_MBX_SIZE", format!("0x{mn:04X}"));
+                    }
+                    if let Some(mx) = max_opt {
+                        set_kv("MAX_MBX_SIZE", format!("0x{mx:04X}"));
+                    }
+                    if let Some(df) = def_opt {
+                        set_kv("DEF_MBX_SIZE", format!("0x{df:04X}"));
+                    }
+                }
+                "MBoxIn" => {
+                    if let Some(st) = start_opt {
+                        set_kv("DEF_MBX_READ_ADDRESS", format!("0x{st:04X}"));
+                    }
+                }
+                "Outputs" => {
+                    if let Some(st) = start_opt {
+                        set_kv("MIN_PD_WRITE_ADDRESS", format!("0x{st:04X}"));
+                    }
+                }
+                "Inputs" => {
+                    if let Some(st) = start_opt {
+                        set_kv("DEF_PD_READ_ADDRESS", format!("0x{st:04X}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Mailbox protocols
+        if let Some(mbx_el) = dev_el.child("Mailbox") {
+            set_kv("MAILBOX_SUPPORTED", "1".to_string());
+            set_kv(
+                "AOE_SUPPORTED",
+                if mbx_el.child("AoE").is_some() {
+                    "1"
+                } else {
+                    "0"
+                }
+                .to_string(),
+            );
+            set_kv(
+                "EOE_SUPPORTED",
+                if mbx_el.child("EoE").is_some() {
+                    "1"
+                } else {
+                    "0"
+                }
+                .to_string(),
+            );
+            if let Some(coe_el) = mbx_el.child("CoE") {
+                set_kv("COE_SUPPORTED", "1".to_string());
+                if let Some(ca) = coe_el.attr("CompleteAccess") {
+                    let b = ca == "1" || ca.eq_ignore_ascii_case("true");
+                    set_kv(
+                        "COMPLETE_ACCESS_SUPPORTED",
+                        if b { "1" } else { "0" }.to_string(),
+                    );
+                }
+                if let Some(seg) = coe_el.attr("SegmentedSdo") {
+                    let b = seg == "1" || seg.eq_ignore_ascii_case("true");
+                    set_kv(
+                        "SEGMENTED_SDO_SUPPORTED",
+                        if b { "1" } else { "0" }.to_string(),
+                    );
+                }
+                if let Some(dh) = coe_el.attr("DiagHistory") {
+                    let b = dh == "1" || dh.eq_ignore_ascii_case("true");
+                    set_kv("DIAGNOSIS_SUPPORTED", if b { "1" } else { "0" }.to_string());
+                }
+            } else {
+                set_kv("COE_SUPPORTED", "0".to_string());
+            }
+            set_kv(
+                "FOE_SUPPORTED",
+                if mbx_el.child("FoE").is_some() {
+                    "1"
+                } else {
+                    "0"
+                }
+                .to_string(),
+            );
+            set_kv(
+                "SOE_SUPPORTED",
+                if mbx_el.child("SoE").is_some() {
+                    "1"
+                } else {
+                    "0"
+                }
+                .to_string(),
+            );
+            set_kv(
+                "VOE_SUPPORTED",
+                if mbx_el.child("VoE").is_some() {
+                    "1"
+                } else {
+                    "0"
+                }
+                .to_string(),
+            );
+        } else {
+            set_kv("MAILBOX_SUPPORTED", "0".to_string());
+        }
+
+        // Distributed Clocks
+        if let Some(dc_el) = dev_el.child("Dc") {
+            let has_dc_assign = dc_el.children_named("OpMode").any(|op| {
+                op.child_text("AssignActivate")
+                    .and_then(|s| parse_setting_u32(&s).ok())
+                    .unwrap_or(0)
+                    != 0
+            });
+            if has_dc_assign || dc_el.children_named("OpMode").next().is_some() {
+                set_kv("DC_SUPPORTED", "1".to_string());
+            }
+        }
+
+        // Eeprom
+        if let Some(eep_el) = dev_el.child("Eeprom") {
+            if let Some(bs) = eep_el
+                .child_text("ByteSize")
+                .and_then(|s| parse_setting_u32(&s).ok())
+            {
+                set_kv("ESC_EEPROM_SIZE", format!("0x{bs:X}"));
+            }
+            if let Some(cd) = eep_el.child_text("ConfigData") {
+                let t = cd.trim();
+                if !t.is_empty() {
+                    set_kv("ESC_CONFIG_DATA", t.to_string());
+                }
+            }
+            set_kv(
+                "BOOTSTRAPMODE_SUPPORTED",
+                if eep_el.child("BootStrap").is_some() {
+                    "1"
+                } else {
+                    "0"
+                }
+                .to_string(),
+            );
+        }
+
+        // Overlay `<Info><VendorSpecific><SSC><Settings>` or `<Device><VendorSpecific><SSC><Settings>` if present!
+        let mut ssc_version = String::new();
+        for vs_parent in [
+            dev_el.child("Info").and_then(|i| i.child("VendorSpecific")),
+            dev_el.child("VendorSpecific"),
+            dev_el
+                .child("Profile")
+                .and_then(|p| p.child("VendorSpecific")),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(ssc_el) = vs_parent.child("SSC") {
+                if let Some(v) = ssc_el.attr("SSCVersion").or_else(|| ssc_el.attr("Version")) {
+                    ssc_version = get_clear_value(v);
+                }
+                if let Some(settings_el) = ssc_el.child("Settings") {
+                    for s_el in settings_el.children_named("Setting") {
+                        let cd_opt = s_el.attr("Name").or_else(|| s_el.attr("CodeDefine"));
+                        if let (Some(cd), Some(val)) = (cd_opt, s_el.attr("Value")) {
+                            let clean_cd = get_clear_value(cd).trim().to_string();
+                            if !clean_cd.is_empty() {
+                                set_kv(&clean_cd, get_clear_value(val));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let settings: Vec<ExternalConfigSetting> = order
+            .into_iter()
+            .filter_map(|k| {
+                map.remove(&k).map(|v| ExternalConfigSetting {
+                    code_define: k,
+                    value: Some(v),
+                    visible_flag: None,
+                })
+            })
+            .collect();
+
+        out.push(ExternalConfiguration {
+            name: dev_name,
+            ssc_version,
+            config_version: String::new(),
+            vendor_id: vendor_id.clone(),
+            vendor_name: vendor_name.clone(),
+            info: match source_path {
+                Some(p) => format!("Imported from ESI {}", p.display()),
+                None => "Imported from ESI XML".to_string(),
+            },
+            patch_rel_path: String::new(),
+            application_rel_path: String::new(),
+            source_folder: String::new(),
+            esi_folder: String::new(),
+            settings,
+            files: Vec::new(),
+            esi_fragments: Vec::new(),
+            source_config_path: source_path.map(Path::to_path_buf),
+        });
+    }
+
+    if out.is_empty() {
+        return Err(CliError::Format(
+            "No <Device> entries found inside <EtherCATInfo>".into(),
+        ));
     }
     Ok(out)
 }
@@ -2533,6 +3292,7 @@ pub fn load_ssc_options(explicit_path: Option<&Path>) -> Result<SscToolOptions> 
     let mut apply_default_patch = None;
     let mut default_patch_file = default_appdata_tool_dir().map(|d| d.join("DefaultPatch.patch"));
     let mut add_delete_comment = false;
+    let mut add_code_config_to_esi = false;
     let mut block_mismatching_values = true;
     let mut dependent_apply_all = true;
     let mut external_configuration_files = Vec::new();
@@ -2562,6 +3322,9 @@ pub fn load_ssc_options(explicit_path: Option<&Path>) -> Result<SscToolOptions> 
             "AddDeleteComment" => {
                 add_delete_comment = val.eq_ignore_ascii_case("true") || val == "1";
             }
+            "AddCodeConfigToEsi" => {
+                add_code_config_to_esi = val.eq_ignore_ascii_case("true") || val == "1";
+            }
             "BlockMismatchingValues" => {
                 block_mismatching_values = !val.eq_ignore_ascii_case("false") && val != "0";
             }
@@ -2584,6 +3347,7 @@ pub fn load_ssc_options(explicit_path: Option<&Path>) -> Result<SscToolOptions> 
         apply_default_patch_on_new_projects: apply_default_patch,
         default_patch_file,
         add_delete_comment,
+        add_code_config_to_esi,
         block_mismatching_values,
         dependent_setting_change_apply_all: dependent_apply_all,
         external_configuration_files,

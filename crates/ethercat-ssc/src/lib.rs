@@ -59,6 +59,8 @@ pub struct SscGenerateOptions {
     pub add_delete_comment: bool,
     pub no_esp: bool,
     pub no_esi: bool,
+    pub esi_code_config: bool,
+    pub esi_trace_file: Option<String>,
     pub sii_out: Option<PathBuf>,
     pub strict_conflicts: bool,
     pub ignore_errors: bool,
@@ -103,9 +105,11 @@ pub fn generate_ssc_project(opts: &SscGenerateOptions) -> Result<SscGenerateRepo
     };
 
     let mut add_delete_comment = opts.add_delete_comment;
+    let mut add_code_config_to_esi = opts.esi_code_config;
     if opts.use_gui_options || opts.options_file.is_some() {
         let gui_opts = load_ssc_options(opts.options_file.as_deref())?;
         add_delete_comment = add_delete_comment || gui_opts.add_delete_comment;
+        add_code_config_to_esi = add_code_config_to_esi || gui_opts.add_code_config_to_esi;
         project.apply_gui_options(&gui_opts)?;
     }
 
@@ -127,11 +131,11 @@ pub fn generate_ssc_project(opts: &SscGenerateOptions) -> Result<SscGenerateRepo
         active_app = Some(app);
     }
 
-    // 2. `-c`: Apply external or embedded configuration
+    // 2. `-c`: Apply external or embedded configuration (single `.xml`/`.escfg`/ESI file or directory)
     if let Some(cfg_path) = &opts.config_file {
-        if !cfg_path.is_file() {
+        if !cfg_path.exists() {
             return Err(CliError::Usage(format!(
-                "The configuration file '{}' does not exist",
+                "The configuration file or directory '{}' does not exist",
                 cfg_path.display()
             )));
         }
@@ -268,9 +272,21 @@ pub fn generate_ssc_project(opts: &SscGenerateOptions) -> Result<SscGenerateRepo
 
     // 9. Write `<ProjectName>.xml` ESI file
     let esi_file_path = target_dir.join(format!("{project_name}.xml"));
-    let esi_bytes = create_device_description_bytes(&project, active_app.as_ref(), false, None)?;
+    let esi_trace_ref = opts.esi_trace_file.as_deref();
+    let esi_bytes = create_device_description_bytes(
+        &project,
+        active_app.as_ref(),
+        add_code_config_to_esi,
+        esi_trace_ref,
+    )?;
     let esi_file = if !opts.no_esi {
-        write_device_description(&esi_file_path, &project, active_app.as_ref(), false, None)?;
+        write_device_description(
+            &esi_file_path,
+            &project,
+            active_app.as_ref(),
+            add_code_config_to_esi,
+            esi_trace_ref,
+        )?;
         Some(esi_file_path.display().to_string())
     } else {
         None
@@ -526,7 +542,18 @@ fn write_project_source_files(
         })
         .collect();
 
-    let ecat_def_bytes = render_ecat_def_h(&project.ssc_version, &entries, &all_defines, None);
+    let conflict_lines = if raw_files {
+        project.render_conflict_directives()
+    } else {
+        Vec::new()
+    };
+    let conflict_slice = if raw_files && !conflict_lines.is_empty() {
+        Some(conflict_lines.as_slice())
+    } else {
+        None
+    };
+    let ecat_def_bytes =
+        render_ecat_def_h(&project.ssc_version, &entries, &all_defines, conflict_slice);
     fs::write(src_dir.join("ecat_def.h"), ecat_def_bytes)?;
     written_files.push("ecat_def.h".to_string());
 
@@ -542,6 +569,8 @@ pub struct SscOdGenerateOptions {
     pub offline_xml_out: Option<PathBuf>,
     pub device_index: usize,
     pub overwrite_app_files: bool,
+    pub force: bool,
+    pub strict_validation: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -564,6 +593,10 @@ pub struct SscOdGenerateReport {
     pub offline_od_backup: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_esi: Option<SscEsiUpdateSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validation_warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_invalid_objects: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -639,6 +672,39 @@ pub fn run_standalone_od_tool(opts: &SscOdGenerateOptions) -> Result<SscOdGenera
         app.od.name = app.name.clone();
     }
 
+    let val_rep = app.od.validate_objects(opts.strict_validation, opts.force);
+    if !opts.force && !val_rep.errors.is_empty() {
+        return Err(CliError::Validation(val_rep.errors.join("; ")));
+    }
+    if opts.force && !val_rep.skipped_objects.is_empty() {
+        // Purge any auto-generated PDO mapping entries pointing to skipped objects and re-finalize
+        for (&pdo_idx, pdo_obj) in app.od.objects.iter_mut() {
+            if (0x1600..=0x17FF).contains(&pdo_idx) || (0x1A00..=0x1BFF).contains(&pdo_idx) {
+                pdo_obj.entries.retain(|e| {
+                    if e.sub_index == 0 {
+                        return true;
+                    }
+                    let be = crate::od::types::reverse_hex_byte_pairs(&e.default_data);
+                    if be.len() >= 4 {
+                        if let Ok(mapped_idx) = u16::from_str_radix(&be[..4], 16) {
+                            return !val_rep.skipped_objects.contains(&mapped_idx);
+                        }
+                    }
+                    true
+                });
+                for (seq, e) in pdo_obj
+                    .entries
+                    .iter_mut()
+                    .filter(|e| e.sub_index > 0)
+                    .enumerate()
+                {
+                    e.sub_index = (seq + 1) as u8;
+                }
+            }
+        }
+        app.od.finalize_and_validate(false);
+    }
+
     let input_dir = opts.inputs[0]
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -646,7 +712,14 @@ pub fn run_standalone_od_tool(opts: &SscOdGenerateOptions) -> Result<SscOdGenera
 
     let src_dir = match &opts.src_out_dir {
         Some(d) => d.clone(),
-        None => input_dir.join("Src"),
+        None => {
+            let candidate_src = input_dir.join("Src");
+            if candidate_src.is_dir() {
+                candidate_src
+            } else {
+                input_dir.join("output")
+            }
+        }
     };
 
     let c_out = write_standalone_od_c_files(&app, &src_dir, opts.overwrite_app_files)?;
@@ -704,6 +777,12 @@ pub fn run_standalone_od_tool(opts: &SscOdGenerateOptions) -> Result<SscOdGenera
         offline_od_xml,
         offline_od_backup,
         updated_esi,
+        validation_warnings: val_rep.warnings,
+        skipped_invalid_objects: val_rep
+            .skipped_objects
+            .into_iter()
+            .map(|idx| format!("0x{idx:04X}"))
+            .collect(),
     })
 }
 

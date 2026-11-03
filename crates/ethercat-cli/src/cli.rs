@@ -1298,7 +1298,7 @@ pub enum SscSubcommand {
 Discovers the installed SSC configuration automatically (from `-p`, `--ssc-dir`, `ETHERCAT_SSC_DIR`, Windows Registry `HKLM\\SOFTWARE\\(Wow6432Node\\)Beckhoff\\ET9300`, or `%APPDATA%\\Beckhoff Automation GmbH & Co. KG\\ET9300 Tool\\SSC\\cfg\\SlaveConfigFile.escfg`).",
         after_long_help = "EXAMPLES:\n  # Generate default EL9800 SSC stack, SlaveProject.xml ESI, and SlaveProject.esp\n  ethercat-cli ssc generate --output ./out_slave\n\n  # Import a custom XLSX/CSV Object Dictionary and override VENDOR_ID + CREATE_EEPROM_CONTENT\n  ethercat-cli ssc generate -a MyDrive.xlsx -d VENDOR_ID=0xE0000002 -d CREATE_EEPROM_CONTENT=1 --output ./out_drive\n\n  # Apply an external hardware configuration with third-party source file import enabled\n  ethercat-cli ssc generate -c CustomConfigs.xml --config-name \"FC1100 Sample\" --allow-file-import --output ./out_fc1100"
     )]
-    Generate(SscGenerateArgs),
+    Generate(Box<SscGenerateArgs>),
 
     /// [OFFLINE] List SSC configuration defines, values, types, flags, and descriptions (`SSC Tool Cmd -l` parity).
     #[command(
@@ -1404,6 +1404,76 @@ Discovers the installed SSC configuration automatically (from `-p`, `--ssc-dir`,
         /// Ignore unknown/legacy `#define` macros not present in the base SSC schema.
         #[arg(long)]
         ignore_errors: bool,
+    },
+
+    /// [OFFLINE] Import SSC device/mailbox/SM/DC settings from an ETG.2000 ESI `.xml` (`SlaveSetting::ParseESI` parity) into `.esp` or `.xml` config.
+    #[command(
+        after_long_help = "EXAMPLES:\n  ethercat-cli ssc import-esi --esi Device.xml --output ImportedFromEsi.esp"
+    )]
+    ImportEsi {
+        /// Path to source ETG.2000 ESI `.xml` file.
+        #[arg(long, value_name = "ESI_XML")]
+        esi: PathBuf,
+
+        /// 0-based `<Device>` index inside `<Devices>` to import from.
+        #[arg(long, default_value_t = 0, value_parser = parse_usize, value_name = "IDX")]
+        device_index: usize,
+
+        /// Base SSC `.escfg`/`.esp` template to apply imported settings onto. Auto-discovered if omitted.
+        #[arg(short = 'p', long = "project", value_name = "PATH")]
+        project: Option<PathBuf>,
+
+        /// Explicit SSC root directory override.
+        #[arg(long, value_name = "DIR")]
+        ssc_dir: Option<PathBuf>,
+
+        /// Output `.esp` project path (or `.xml` if ending with `.xml` to save as `<SscToolConfiguration>`).
+        #[arg(long = "output", value_name = "OUT_PATH")]
+        output: PathBuf,
+
+        /// Ignore unknown settings not present in the base SSC schema.
+        #[arg(long)]
+        ignore_errors: bool,
+    },
+
+    /// [OFFLINE] Migrate/adapt an older `.esp` SSC project onto a newer SSC version (`SlaveProject::AdaptProject` parity).
+    #[command(
+        after_long_help = "EXAMPLES:\n  ethercat-cli ssc migrate -p OldSlave_5v12.esp --output MigratedSlave_5v13.esp"
+    )]
+    Migrate {
+        /// Existing `.esp` project file to migrate.
+        #[arg(short = 'p', long = "project", value_name = "OLD_ESP")]
+        project: PathBuf,
+
+        /// Target SSC `.escfg` / `SlaveConfigFile.xml` or SSC folder (auto-discovered if omitted).
+        #[arg(long, value_name = "TARGET_CFG")]
+        target_ssc: Option<PathBuf>,
+
+        /// Explicit SSC root directory override for the target SSC version.
+        #[arg(long, value_name = "DIR")]
+        ssc_dir: Option<PathBuf>,
+
+        /// Output path for the migrated `.esp` project file.
+        #[arg(long = "output", value_name = "NEW_ESP")]
+        output: PathBuf,
+
+        /// Continue past non-fatal setting migration mismatches.
+        #[arg(long)]
+        ignore_errors: bool,
+    },
+
+    /// [OFFLINE] Combine multiple ETG.2000 ESI `.xml` files into one multi-device ESI XML (`EsiGenerator::CombineEsiFiles` parity).
+    #[command(
+        after_long_help = "EXAMPLES:\n  ethercat-cli ssc combine-esi -i SlaveA.xml -i SlaveB.xml --output CombinedCatalog.xml"
+    )]
+    CombineEsi {
+        /// Two or more input ETG.2000 ESI `.xml` files to merge (`<Groups>`, `<Scalings>`, `<Devices>`, `<Modules>`).
+        #[arg(short = 'i', long = "input", required = true, num_args = 1.., value_name = "ESI_XML")]
+        inputs: Vec<PathBuf>,
+
+        /// Destination combined ESI `.xml` path (backs up existing file to `<output>.bak`).
+        #[arg(long = "output", value_name = "OUT_ESI_XML")]
+        output: PathBuf,
     },
 
     /// [OFFLINE] Validate `<SettingConflicts>` rules and `UpdateInformation.xml` known issues on an SSC project.
@@ -1545,6 +1615,14 @@ pub struct SscGenerateArgs {
     #[arg(long)]
     pub no_esi: bool,
 
+    /// Embed `<VendorSpecific><SSC><Settings>` inside generated `<Project>.xml` ESI (`AddCodeConfigToEsi` parity).
+    #[arg(long)]
+    pub esi_code_config: bool,
+
+    /// Embed `<VendorSpecific><TwinCAT><TraceFile>` path inside generated `<Project>.xml` ESI.
+    #[arg(long, value_name = "TRACE_PATH")]
+    pub esi_trace_file: Option<String>,
+
     /// Also compile the generated ESI XML directly into a binary SII EEPROM image (`.bin`).
     #[arg(long, value_name = "SII_BIN")]
     pub sii_out: Option<PathBuf>,
@@ -1560,9 +1638,9 @@ pub struct SscGenerateArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum SscOdSubcommand {
-    /// [OFFLINE] Standalone `SSC OD Tool` generator: parse `.xlsx`/`.csv`/`.xml`/`.eds`/`.tmc` into `Src/<App>Objects.h`, `<App>.h`, `<App>.c`, and `output/<App>Objects.xml` (or update ESI).
+    /// [OFFLINE] Standalone `SSC OD Tool` generator: parse `.xlsx`/`.xlsm`/`.csv`/`.xml`/`.esp`/`.eds`/`.tmc` into `<App>Objects.h`, `<App>.h`, `<App>.c`, and `output/<App>Objects.xml` (or update ESI).
     #[command(
-        after_long_help = "EXAMPLES:\n  # Generate Src/<App>Objects.h, <App>.h, <App>.c, and output/<App>Objects.xml\n  ethercat-cli ssc od generate MyOd.xlsx\n\n  # Generate C headers into custom dir and update an existing ESI XML in place\n  ethercat-cli ssc od generate MyOd.csv --src-dir ./firmware/Src --esi ./TargetEsi.xml"
+        after_long_help = "EXAMPLES:\n  # Generate <App>Objects.h, <App>.h, <App>.c, and output/<App>Objects.xml\n  ethercat-cli ssc od generate MyOd.xlsx\n\n  # Generate C headers into custom dir and update an existing ESI XML in place\n  ethercat-cli ssc od generate MyOd.csv --src-dir ./firmware/Src --esi ./TargetEsi.xml"
     )]
     Generate(SscOdGenerateArgs),
 
@@ -1579,19 +1657,53 @@ pub enum SscOdSubcommand {
         #[arg(long, value_enum, ignore_case = true, value_name = "csv|xlsx")]
         kind: Option<SscTemplateKind>,
     },
+
+    /// [OFFLINE] Export any Object Dictionary source (`.xlsx`, `.xlsm`, `.xml`, `.esp`, `.eds`, `.tmc`, `.csv`) to a semicolon-delimited SSC `.csv` table.
+    #[command(
+        after_long_help = "EXAMPLES:\n  ethercat-cli ssc od export --input SlaveProject.esp --output ExportedOd.csv\n  ethercat-cli ssc od export --input Device.xml --output DeviceOd.csv"
+    )]
+    Export {
+        /// Source Object Dictionary file (`.xlsx`, `.xlsm`, `.csv`, `.xml`, `.esp`, `.eds`, `.tmc`).
+        #[arg(short = 'i', long = "input", value_name = "OD_INPUT")]
+        input: PathBuf,
+
+        /// Destination `.csv` file path.
+        #[arg(short = 'o', long = "output", value_name = "CSV_OUT")]
+        output: PathBuf,
+
+        /// Optional 0-based worksheet index when `--input` is `.xlsx`/`.xlsm`.
+        #[arg(long, value_parser = parse_usize, value_name = "SHEET_IDX")]
+        worksheet: Option<usize>,
+    },
+
+    /// [OFFLINE] Validate Object Dictionary rules (reserved C keywords, MDP `0x6000`/`0x7000` PDO directions, ObjectCode, bit/word alignment).
+    #[command(after_long_help = "EXAMPLES:\n  ethercat-cli ssc od check MyOd.xlsx --strict")]
+    Check {
+        /// Input Object Dictionary file(s) (`.xlsx`, `.xlsm`, `.csv`, `.xml`, `.esp`, `.eds`, `.tmc`).
+        #[arg(required = true, num_args = 1.., value_name = "OD_INPUT")]
+        inputs: Vec<PathBuf>,
+
+        /// Optional 0-based worksheet index when parsing `.xlsx`/`.xlsm`.
+        #[arg(long, value_parser = parse_usize, value_name = "SHEET_IDX")]
+        worksheet: Option<usize>,
+
+        /// Also check SSC C struct bit/word alignment rules (`check_ssc_alignment_rules`).
+        #[arg(long)]
+        strict: bool,
+    },
 }
 
 #[derive(Debug, Args)]
 pub struct SscOdGenerateArgs {
-    /// Input Object Dictionary file(s) (`.xlsx`, `.csv`, `.xml`, `.eds`, `.tmc`).
+    /// Input Object Dictionary file(s) (`.xlsx`, `.xlsm`, `.csv`, `.xml`, `.esp`, `.eds`, `.tmc`).
     #[arg(required = true, num_args = 1.., value_name = "OD_INPUT")]
     pub inputs: Vec<PathBuf>,
 
-    /// 0-based worksheet index when parsing multi-sheet `.xlsx` files (`/WS<N>` parity).
+    /// 0-based worksheet index when parsing multi-sheet `.xlsx`/`.xlsm` files (`/WS<N>` parity).
     #[arg(long, value_parser = parse_usize, value_name = "SHEET_IDX")]
     pub worksheet: Option<usize>,
 
-    /// Output folder for `<App>Objects.h`, `<App>.h`, and `<App>.c` (defaults to `<InputDir>/Src`).
+    /// Output folder for `<App>Objects.h`, `<App>.h`, and `<App>.c` (defaults to `<InputDir>/Src` if present, else `<InputDir>/output`).
     #[arg(long, value_name = "SRC_DIR")]
     pub src_dir: Option<PathBuf>,
 
@@ -1610,4 +1722,12 @@ pub struct SscOdGenerateArgs {
     /// Overwrite `<App>.c` and `<App>.h` even if `<App>.*` already exists in `--src-dir` (`<App>Objects.h` is always updated with `.bak` backup).
     #[arg(long)]
     pub overwrite_app: bool,
+
+    /// Force generation (`SSC_OD_Tool -f` parity): skip invalid OD objects instead of aborting on validation errors.
+    #[arg(short = 'f', long)]
+    pub force: bool,
+
+    /// Enforce SSC C struct bit/word alignment rules during OD validation.
+    #[arg(long)]
+    pub strict: bool,
 }

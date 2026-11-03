@@ -3,12 +3,15 @@ use serde_json::{json, Value};
 use crate::cli::{SscOdSubcommand, SscSubcommand, SscTemplateKind};
 use crate::commands::{write_file_bytes, CommandRender};
 use ethercat_ssc::archive::encode_image_data_16x14;
-use ethercat_ssc::esi_gen::update_esi_file;
+use ethercat_ssc::esi_gen::{combine_esi_files, update_esi_file};
 use ethercat_ssc::model::{
     export_ssc_tool_configuration_xml, import_settings_from_ecat_def_h,
-    load_external_configurations, SlaveProject,
+    import_settings_from_esi_xml, load_external_configurations, SlaveProject,
 };
-use ethercat_ssc::od::{parse_application_files, write_csv_template, write_xlsx_template};
+use ethercat_ssc::od::{
+    parse_application_files, parse_single_application_file_with_sheet, write_csv_template,
+    write_od_to_csv, write_xlsx_template,
+};
 use ethercat_ssc::{
     apply_patch_to_directory, generate_ssc_project, run_standalone_od_tool, SscEsiUpdateSummary,
     SscGenerateOptions, SscOdGenerateOptions,
@@ -36,6 +39,8 @@ pub fn handle_ssc(sub: &SscSubcommand) -> Result<CommandRender> {
                 add_delete_comment: args.delete_comments,
                 no_esp: args.no_esp,
                 no_esi: args.no_esi,
+                esi_code_config: args.esi_code_config,
+                esi_trace_file: args.esi_trace_file.clone(),
                 sii_out: args.sii_out.clone(),
                 strict_conflicts: args.strict_conflicts,
                 ignore_errors: args.ignore_errors,
@@ -297,6 +302,123 @@ pub fn handle_ssc(sub: &SscSubcommand) -> Result<CommandRender> {
             })
         }
 
+        SscSubcommand::ImportEsi {
+            esi,
+            device_index,
+            project,
+            ssc_dir,
+            output,
+            ignore_errors,
+        } => {
+            let imported_cfg = import_settings_from_esi_xml(esi, *device_index)?;
+            let mut prj = SlaveProject::load(project.as_deref(), ssc_dir.as_deref())?;
+            let _ = prj.apply_configuration(&imported_cfg, false, *ignore_errors)?;
+            let is_xml = output
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("xml"));
+
+            let final_path = if is_xml {
+                let bytes =
+                    export_ssc_tool_configuration_xml(&prj, &imported_cfg.name, &imported_cfg.info);
+                write_file_bytes(output, &bytes)?;
+                output.clone()
+            } else {
+                prj.save_esp(output)?
+            };
+
+            Ok(CommandRender {
+                json: json!({
+                    "esi_file": esi.display().to_string(),
+                    "device_index": device_index,
+                    "configuration_name": imported_cfg.name,
+                    "imported_setting_count": imported_cfg.settings.len(),
+                    "esi_ssc_version": imported_cfg.ssc_version,
+                    "project_ssc_version": prj.ssc_version,
+                    "output_file": final_path.display().to_string(),
+                }),
+                text: format!(
+                    "Imported {} settings from ESI '{}' (device #{}) -> '{}'",
+                    imported_cfg.settings.len(),
+                    esi.display(),
+                    device_index,
+                    final_path.display()
+                ),
+            })
+        }
+
+        SscSubcommand::Migrate {
+            project,
+            target_ssc,
+            ssc_dir,
+            output,
+            ignore_errors,
+        } => {
+            let old_prj = SlaveProject::load(Some(project.as_path()), None)?;
+            let mut target_prj = SlaveProject::load(target_ssc.as_deref(), ssc_dir.as_deref())?;
+            let rep = target_prj.adapt_from(&old_prj, *ignore_errors)?;
+            let has_app = target_prj.application_xml.is_some();
+            let saved = target_prj.save_esp(output)?;
+
+            let mut lines = vec![format!(
+                "Migrated SSC project '{}' (SSC {} -> {}) -> '{}'",
+                project.display(),
+                rep.from_ssc_version,
+                rep.to_ssc_version,
+                saved.display()
+            )];
+            lines.push(format!(
+                "  Settings migrated: {}, user files kept: {}, ESI fragments kept: {}, OD kept: {}",
+                rep.migrated_setting_count,
+                rep.preserved_user_files.len(),
+                rep.preserved_esi_fragments,
+                has_app
+            ));
+            for w in &rep.warnings {
+                lines.push(format!("  Warning: {w}"));
+            }
+
+            Ok(CommandRender {
+                json: json!({
+                    "source_project": project.display().to_string(),
+                    "output_file": saved.display().to_string(),
+                    "preserved_application": has_app,
+                    "report": rep,
+                }),
+                text: lines.join("\n"),
+            })
+        }
+
+        SscSubcommand::CombineEsi { inputs, output } => {
+            let outcome = combine_esi_files(inputs, output)?;
+            let mut lines = vec![format!(
+                "Combined {} ESI file(s) -> '{}' ({} devices, {} groups, {} modules)",
+                outcome.input_count,
+                outcome.output_path,
+                outcome.device_count,
+                outcome.group_count,
+                outcome.module_count
+            )];
+            if let Some(ref bak) = outcome.backup_path {
+                lines.push(format!("  Backup saved: '{bak}'"));
+            }
+            for w in &outcome.warnings {
+                lines.push(format!("  Warning: {w}"));
+            }
+            Ok(CommandRender {
+                json: json!({
+                    "output_file": outcome.output_path,
+                    "backup_file": outcome.backup_path,
+                    "input_count": outcome.input_count,
+                    "device_count": outcome.device_count,
+                    "group_count": outcome.group_count,
+                    "module_count": outcome.module_count,
+                    "warnings": outcome.warnings,
+                }),
+                text: lines.join("\n"),
+            })
+        }
+
         SscSubcommand::Check {
             project,
             ssc_dir,
@@ -349,6 +471,8 @@ pub fn handle_ssc(sub: &SscSubcommand) -> Result<CommandRender> {
                     offline_xml_out: args.offline_xml.clone(),
                     device_index: args.device_index,
                     overwrite_app_files: args.overwrite_app,
+                    force: args.force,
+                    strict_validation: args.strict,
                 })?;
 
                 let mut lines = vec![format!(
@@ -376,6 +500,15 @@ pub fn handle_ssc(sub: &SscSubcommand) -> Result<CommandRender> {
                         "  Updated ESI    : '{}' (backup: '{}')",
                         ue.esi_path, ue.backup_path
                     ));
+                }
+                if !rep.skipped_invalid_objects.is_empty() {
+                    lines.push(format!(
+                        "  Skipped invalid: {}",
+                        rep.skipped_invalid_objects.join(", ")
+                    ));
+                }
+                for w in &rep.validation_warnings {
+                    lines.push(format!("  Warning        : {w}"));
                 }
 
                 Ok(CommandRender {
@@ -417,6 +550,78 @@ pub fn handle_ssc(sub: &SscSubcommand) -> Result<CommandRender> {
                         "Created SSC Object Dictionary {kind_name} wizard template -> '{}'",
                         output.display()
                     ),
+                })
+            }
+
+            SscOdSubcommand::Export {
+                input,
+                output,
+                worksheet,
+            } => {
+                let app = parse_single_application_file_with_sheet(input, false, *worksheet)?;
+                write_od_to_csv(&app.od, output)?;
+                Ok(CommandRender {
+                    json: json!({
+                        "input_file": input.display().to_string(),
+                        "output_file": output.display().to_string(),
+                        "app_name": app.name,
+                        "object_count": app.od.objects.len(),
+                    }),
+                    text: format!(
+                        "Exported {} OD objects from '{}' -> '{}'",
+                        app.od.objects.len(),
+                        input.display(),
+                        output.display()
+                    ),
+                })
+            }
+
+            SscOdSubcommand::Check {
+                inputs,
+                worksheet,
+                strict,
+            } => {
+                let mut app = if let Some(ws) = worksheet {
+                    let mut base =
+                        parse_single_application_file_with_sheet(&inputs[0], false, Some(*ws))?;
+                    for extra in &inputs[1..] {
+                        let next =
+                            parse_single_application_file_with_sheet(extra, false, Some(*ws))?;
+                        for (_, obj) in next.od.objects {
+                            base.od.objects.insert(obj.index, obj);
+                        }
+                    }
+                    base.od.finalize_and_validate(true);
+                    base
+                } else {
+                    parse_application_files(inputs, false)?
+                };
+                let rep = app.od.validate_objects(*strict, false);
+                let mut lines = vec![format!(
+                    "OD Check '{}': {} objects, {} errors, {} warnings",
+                    app.name,
+                    app.od.objects.len(),
+                    rep.errors.len(),
+                    rep.warnings.len()
+                )];
+                for e in &rep.errors {
+                    lines.push(format!("  [ERROR] {e}"));
+                }
+                for w in &rep.warnings {
+                    lines.push(format!("  [WARN ] {w}"));
+                }
+                if !rep.errors.is_empty() {
+                    return Err(CliError::Validation(rep.errors.join("; ")));
+                }
+                Ok(CommandRender {
+                    json: json!({
+                        "app_name": app.name,
+                        "object_count": app.od.objects.len(),
+                        "valid": rep.errors.is_empty(),
+                        "errors": rep.errors,
+                        "warnings": rep.warnings,
+                    }),
+                    text: lines.join("\n"),
                 })
             }
         },

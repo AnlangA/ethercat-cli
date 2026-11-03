@@ -12,6 +12,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
+
 use crate::expr::{evaluate_boolean_expression, resolve_value_expression};
 use crate::model::{EsiFragment, SlaveProject, STANDALONE_ESI_UPDATE_DEFAULT_SSC_OBJECTS};
 use crate::od::builtin_ods::build_project_object_dictionary;
@@ -2293,5 +2295,204 @@ pub fn update_esi_file(
         backup_path: bak_path,
         preserved_default_objects,
         discarded_custom_default_objects,
+    })
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EsiCombineOutcome {
+    pub output_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_path: Option<String>,
+    pub input_count: usize,
+    pub device_count: usize,
+    pub group_count: usize,
+    pub module_count: usize,
+    pub warnings: Vec<String>,
+}
+
+/// Combine multiple ETG.2000 `<EtherCATInfo>` ESI `.xml` files into a single multi-device ESI XML file,
+/// matching `EsiGenerator::CombineEsiFiles` (`SSC Tool` `Tool -> Combine ESI Files...`).
+pub fn combine_esi_files(
+    input_files: &[impl AsRef<Path>],
+    output_file: &Path,
+) -> Result<EsiCombineOutcome> {
+    if input_files.is_empty() {
+        return Err(CliError::Usage(
+            "At least one input ESI .xml file is required for combine_esi_files".into(),
+        ));
+    }
+
+    let first_path = input_files[0].as_ref();
+    let mut base_root = parse_dom_file(first_path, false)?;
+    if base_root.local_name() != "EtherCATInfo" {
+        return Err(CliError::Format(format!(
+            "Invalid ESI root '<{}>' in '{}' (expected <EtherCATInfo>)",
+            base_root.name,
+            first_path.display()
+        )));
+    }
+
+    let ver = base_root.attr("Version").unwrap_or("1.6").to_string();
+    let schema_loc = base_root
+        .attr("xsi:noNamespaceSchemaLocation")
+        .unwrap_or("EtherCATInfo.xsd")
+        .to_string();
+    base_root.attrs.clear();
+    base_root.push_attr("xmlns:xsi", "http://www.w3.org/2001/XMLSchema-instance");
+    base_root.push_attr("xmlns:xsd", "http://www.w3.org/2001/XMLSchema");
+    base_root.push_attr("xsi:noNamespaceSchemaLocation", schema_loc);
+    base_root.push_attr("Version", ver);
+
+    let base_vendor_id = base_root
+        .child("Vendor")
+        .and_then(|v| v.child_text("Id"))
+        .map(|s| parse_esi_hex_u32_attr(&s));
+
+    let mut merged_groups: Vec<DomElement> = Vec::new();
+    let mut seen_group_types: Vec<String> = Vec::new();
+    let mut merged_scalings: Vec<DomNode> = Vec::new();
+    let mut merged_devices: Vec<DomElement> = Vec::new();
+    let mut merged_modules: Vec<DomElement> = Vec::new();
+    let mut seen_module_keys: Vec<(String, String)> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    for (idx, item) in input_files.iter().enumerate() {
+        let p = item.as_ref();
+        let doc = if idx == 0 {
+            base_root.clone()
+        } else {
+            let parsed = parse_dom_file(p, false)?;
+            if parsed.local_name() != "EtherCATInfo" {
+                return Err(CliError::Format(format!(
+                    "Invalid ESI root '<{}>' in '{}' (expected <EtherCATInfo>)",
+                    parsed.name,
+                    p.display()
+                )));
+            }
+            parsed
+        };
+
+        if idx > 0 {
+            let cur_vid = doc
+                .child("Vendor")
+                .and_then(|v| v.child_text("Id"))
+                .map(|s| parse_esi_hex_u32_attr(&s));
+            if let (Some(b), Some(c)) = (base_vendor_id, cur_vid) {
+                if b != c {
+                    warnings.push(format!(
+                        "ESI file '{}' has Vendor Id 0x{c:08X} differing from base Vendor Id 0x{b:08X}",
+                        p.display()
+                    ));
+                }
+            }
+        }
+
+        if let Some(desc) = doc.child("Descriptions") {
+            if let Some(groups) = desc.child("Groups") {
+                for g in groups.children_named("Group") {
+                    let g_type = g.child_text("Type").unwrap_or_default().trim().to_string();
+                    if g_type.is_empty() || !seen_group_types.iter().any(|s| s == &g_type) {
+                        if !g_type.is_empty() {
+                            seen_group_types.push(g_type);
+                        }
+                        merged_groups.push(g.clone());
+                    }
+                }
+            }
+            if let Some(scalings) = desc.child("Scalings") {
+                merged_scalings.extend(scalings.children.iter().cloned());
+            }
+            if let Some(devs) = desc.child("Devices") {
+                for d in devs.children_named("Device") {
+                    merged_devices.push(d.clone());
+                }
+            }
+            if let Some(mods) = desc.child("Modules") {
+                for m in mods.children_named("Module") {
+                    let ty_el = m.child("Type");
+                    let m_type = ty_el
+                        .map(|t| t.inner_text().trim().to_string())
+                        .unwrap_or_default();
+                    let m_ident = ty_el
+                        .and_then(|t| t.attr("ModuleIdent"))
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let key = (m_type, m_ident);
+                    if !seen_module_keys.iter().any(|k| k == &key) {
+                        seen_module_keys.push(key);
+                        merged_modules.push(m.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    if merged_devices.is_empty() {
+        return Err(CliError::Validation(
+            "Input ESI files contain zero <Device> definitions".into(),
+        ));
+    }
+
+    let group_count = merged_groups.len();
+    let device_count = merged_devices.len();
+    let module_count = merged_modules.len();
+
+    let mut new_desc = DomElement::new("Descriptions");
+    if !merged_groups.is_empty() {
+        let mut groups_el = DomElement::new("Groups");
+        for g in merged_groups {
+            groups_el.push_child(g);
+        }
+        new_desc.push_child(groups_el);
+    }
+    if !merged_scalings.is_empty() {
+        let mut sc_el = DomElement::new("Scalings");
+        sc_el.children = merged_scalings;
+        new_desc.push_child(sc_el);
+    }
+    let mut devs_el = DomElement::new("Devices");
+    for d in merged_devices {
+        devs_el.push_child(d);
+    }
+    new_desc.push_child(devs_el);
+
+    if !merged_modules.is_empty() {
+        let mut mods_el = DomElement::new("Modules");
+        for m in merged_modules {
+            mods_el.push_child(m);
+        }
+        new_desc.push_child(mods_el);
+    }
+
+    base_root
+        .children
+        .retain(|n| !matches!(n, DomNode::Element(e) if e.name == "Descriptions"));
+    base_root.push_child(new_desc);
+    canonicalize_esi_tree(&mut base_root);
+
+    let out_bytes = render_indented_xml_bytes(&base_root, Some(ESI_XML_PROLOG), "\t", true, false);
+    if let Some(parent) = output_file.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let backup_path = if output_file.is_file() {
+        let bak = PathBuf::from(format!("{}.bak", output_file.display()));
+        fs::copy(output_file, &bak)?;
+        Some(bak.display().to_string())
+    } else {
+        None
+    };
+    fs::write(output_file, out_bytes)?;
+
+    Ok(EsiCombineOutcome {
+        output_path: output_file.display().to_string(),
+        backup_path,
+        input_count: input_files.len(),
+        device_count,
+        group_count,
+        module_count,
+        warnings,
     })
 }

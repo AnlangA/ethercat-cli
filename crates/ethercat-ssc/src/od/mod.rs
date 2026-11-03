@@ -15,10 +15,10 @@ pub use c_codegen::{
     render_objects_header, to_upper_snake_macro_ident,
 };
 pub use parsers::{
-    parse_application_files, parse_single_application_file_with_sheet, write_csv_template,
-    write_xlsx_template,
+    export_od_to_csv, parse_application_files, parse_single_application_file_with_sheet,
+    write_csv_template, write_od_to_csv, write_xlsx_template,
 };
-pub use types::SlaveApplication;
+pub use types::{OdValidationReport, SlaveApplication};
 
 /// Build the `SlaveFile` entries (`<App>.c`, `<App>.h`, `<App>Objects.h`, and optional
 /// `Module0x{Ident:08X}_Objects.h`) attached to a `SlaveProject` when importing an application.
