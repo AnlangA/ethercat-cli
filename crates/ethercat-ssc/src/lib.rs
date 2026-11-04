@@ -644,25 +644,11 @@ pub fn run_standalone_od_tool(opts: &SscOdGenerateOptions) -> Result<SscOdGenera
         }
     }
 
-    let mut app = if let Some(ws_idx) = opts.worksheet_index {
-        let mut base = crate::od::parse_single_application_file_with_sheet(
-            &opts.inputs[0],
-            false,
-            Some(ws_idx),
-        )?;
-        for extra in &opts.inputs[1..] {
-            let next =
-                crate::od::parse_single_application_file_with_sheet(extra, false, Some(ws_idx))?;
-            for (_, obj) in next.od.objects {
-                base.od.objects.insert(obj.index, obj);
-            }
-            base.modules.extend(next.modules);
-        }
-        base.od.finalize_and_validate(true);
-        base
-    } else {
-        parse_application_files(&opts.inputs, false)?
-    };
+    let mut app = crate::od::parsers::parse_application_files_with_sheet(
+        &opts.inputs,
+        false,
+        opts.worksheet_index,
+    )?;
 
     if app.name.trim().is_empty() {
         app.name = "MyAppl".to_string();
@@ -847,8 +833,26 @@ fn parse_any_usize(raw: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use crate::expr::evaluate_boolean_expression;
-    use crate::od::types::resolve_data_type_name;
+    use crate::model::{SlaveFileContent, SlaveProject};
+    use crate::od::c_codegen::render_application_c;
+    use crate::od::parsers::{parse_application_files, parse_single_application_file};
+    use crate::od::types::{resolve_data_type_name, reverse_hex_byte_pairs};
+
+    fn make_temp_dir(tag: &str) -> PathBuf {
+        static SEQ: AtomicUsize = AtomicUsize::new(1);
+        let dir = std::env::temp_dir().join(format!(
+            "ethercat_ssc_unit_{tag}_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[test]
     fn ssc_expression_and_od_type_resolution() {
@@ -865,5 +869,239 @@ mod tests {
         let (dt_id, bit_len) = resolve_data_type_name("UINT32").unwrap();
         assert!(dt_id > 0 && bit_len == 32);
         assert!(resolve_data_type_name("äöü").is_err());
+    }
+
+    #[test]
+    fn standalone_application_c_callbacks_have_no_format_placeholders() {
+        let dir = make_temp_dir("cb");
+        let csv_path = dir.join("CallbackApp.csv");
+        let csv = concat!(
+            "Index;ObjectCode;SI;DataType;Name;Default Value;M/O/C;B/S;Access;rx/tx;CoeRead;CoeWrite;Description\r\n",
+            "0x2000;VAR;0;UINT16;ControlParam;0x0001;o;;rw;;ReadParam2000;WriteParam2000;Test callback object\r\n",
+        );
+        fs::write(&csv_path, csv).unwrap();
+
+        let app = parse_single_application_file(&csv_path, false).unwrap();
+        let rendered = render_application_c(&app.od, "CallbackApp", "CallbackApp", false);
+        assert!(
+            !rendered.contains("{0}"),
+            "standalone render_application_c must not emit literal C# '{{0}}' placeholders:\n{rendered}"
+        );
+        assert!(rendered.contains("UINT8 ReadParam2000(UINT16 index, UINT8 subindex"));
+        assert!(rendered.contains("UINT8 WriteParam2000(UINT16 index, UINT8 subindex"));
+        assert!(rendered.contains("Warning: Implement CoE read callback"));
+        assert!(rendered.contains("Warning: Implement CoE write callback"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_file_od_merge_preserves_auto_pdo_mappings() {
+        let dir = make_temp_dir("merge");
+        let base_csv = dir.join("base.csv");
+        let extra_csv = dir.join("extra.csv");
+
+        fs::write(
+            &base_csv,
+            concat!(
+                "Index;ObjectCode;SI;DataType;Name;Default Value;M/O/C;B/S;Access;rx/tx;CoeRead;CoeWrite;Description\r\n",
+                "0x6000;VAR;0;UINT16;BaseInput;0;m;;ro;tx;;;\r\n",
+                "0x7000;VAR;0;UINT16;BaseOutput;0;m;;rw;rx;;;\r\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &extra_csv,
+            concat!(
+                "Index;ObjectCode;SI;DataType;Name;Default Value;M/O/C;B/S;Access;rx/tx;CoeRead;CoeWrite;Description\r\n",
+                "0x6010;VAR;0;UINT32;ExtraInput;0;m;;ro;tx;;;\r\n",
+                "0x7010;VAR;0;UINT32;ExtraOutput;0;m;;rw;rx;;;\r\n",
+            ),
+        )
+        .unwrap();
+
+        let merged = parse_application_files(&[&base_csv, &extra_csv], false).unwrap();
+        assert!(
+            merged.od.get(0x1600).is_some() && merged.od.get(0x1601).is_some(),
+            "expected both 0x1600 and 0x1601 RxPDO mappings after merge"
+        );
+        assert!(
+            merged.od.get(0x1A00).is_some() && merged.od.get(0x1A01).is_some(),
+            "expected both 0x1A00 and 0x1A01 TxPDO mappings after merge"
+        );
+        let map_1600 = reverse_hex_byte_pairs(
+            &merged
+                .od
+                .get(0x1600)
+                .unwrap()
+                .entry(1)
+                .unwrap()
+                .default_data,
+        );
+        let map_1601 = reverse_hex_byte_pairs(
+            &merged
+                .od
+                .get(0x1601)
+                .unwrap()
+                .entry(1)
+                .unwrap()
+                .default_data,
+        );
+        assert_eq!(map_1600, "70000010");
+        assert_eq!(map_1601, "70100020");
+
+        let sm2 = merged.od.get(0x1C12).expect("0x1C12 auto-created");
+        assert_eq!(
+            sm2.entry(1)
+                .map(|e| reverse_hex_byte_pairs(&e.default_data))
+                .as_deref(),
+            Some("1600")
+        );
+        assert_eq!(
+            sm2.entry(2)
+                .map(|e| reverse_hex_byte_pairs(&e.default_data))
+                .as_deref(),
+            Some("1601")
+        );
+
+        let sm3 = merged.od.get(0x1C13).expect("0x1C13 auto-created");
+        assert_eq!(
+            sm3.entry(1)
+                .map(|e| reverse_hex_byte_pairs(&e.default_data))
+                .as_deref(),
+            Some("1A00")
+        );
+        assert_eq!(
+            sm3.entry(2)
+                .map(|e| reverse_hex_byte_pairs(&e.default_data))
+                .as_deref(),
+            Some("1A01")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn esp_embedded_file_preserves_amp_gt_identifiers_and_lf_lines() {
+        let dir = make_temp_dir("esp");
+        let esp_path = dir.join("LfEmbedded.esp");
+        // XML-escaped `&amp;gt_counter` unescapes once in `DomScanner` to `&gt_counter`;
+        // `parse_slave_file_element` must NOT re-unescape `&gt` into `>_counter` and must split `\n` lines.
+        let esp_xml = concat!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n",
+            "<SlaveConfiguratorProject ToolVersion=\"1.5.0.0\" SSCVersion=\"5.13\">\n",
+            "  <Settings />\n",
+            "  <Files>\n",
+            "    <File Name=\"app_logic.c\" Type=\"Src\" Version=\"1.0.0.0\">int gt_counter = 0;\nint *ptr = &amp;gt_counter;\nreturn *ptr;\n</File>\n",
+            "  </Files>\n",
+            "</SlaveConfiguratorProject>\n",
+        );
+        fs::write(&esp_path, esp_xml.as_bytes()).unwrap();
+
+        let proj = SlaveProject::load(Some(&esp_path), None).unwrap();
+        assert_eq!(proj.files.len(), 1);
+        match &proj.files[0].content {
+            SlaveFileContent::TextLines(lines) => {
+                assert_eq!(
+                    lines.as_slice(),
+                    [
+                        "int gt_counter = 0;",
+                        "int *ptr = &gt_counter;",
+                        "return *ptr;",
+                    ]
+                );
+            }
+            other => panic!("expected TextLines, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn esi_default_value_widths_and_eds_sub255() {
+        let dir = make_temp_dir("esi_def");
+        let esi_path = dir.join("Defaults.xml");
+        let esi_xml = concat!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n",
+            "<EtherCATInfo>\n",
+            "  <Descriptions>\n",
+            "    <Devices>\n",
+            "      <Device>\n",
+            "        <Type ProductCode=\"#x1000\" RevisionNo=\"#x0001\">DefDev</Type>\n",
+            "        <Name>DefDev</Name>\n",
+            "        <Profile>\n",
+            "          <ProfileNo>5001</ProfileNo>\n",
+            "          <Dictionary>\n",
+            "            <DataTypes>\n",
+            "              <DataType><Name>USINT</Name><BitSize>8</BitSize></DataType>\n",
+            "              <DataType><Name>UINT</Name><BitSize>16</BitSize></DataType>\n",
+            "              <DataType><Name>INT</Name><BitSize>16</BitSize></DataType>\n",
+            "              <DataType><Name>ULINT</Name><BitSize>64</BitSize></DataType>\n",
+            "            </DataTypes>\n",
+            "            <Objects>\n",
+            "              <Object>\n",
+            "                <Index>#x2001</Index><Name>ByteVal</Name><Type>USINT</Type><BitSize>8</BitSize>\n",
+            "                <Info><DefaultValue>42</DefaultValue></Info>\n",
+            "              </Object>\n",
+            "              <Object>\n",
+            "                <Index>#x2002</Index><Name>WordVal</Name><Type>UINT</Type><BitSize>16</BitSize>\n",
+            "                <Info><DefaultValue>#x1234</DefaultValue></Info>\n",
+            "              </Object>\n",
+            "              <Object>\n",
+            "                <Index>#x2003</Index><Name>NegVal</Name><Type>INT</Type><BitSize>16</BitSize>\n",
+            "                <Info><DefaultValue>-300</DefaultValue></Info>\n",
+            "              </Object>\n",
+            "              <Object>\n",
+            "                <Index>#x2004</Index><Name>QwordVal</Name><Type>ULINT</Type><BitSize>64</BitSize>\n",
+            "                <Info><DefaultValue>#x0102030405060708</DefaultValue></Info>\n",
+            "              </Object>\n",
+            "            </Objects>\n",
+            "          </Dictionary>\n",
+            "        </Profile>\n",
+            "      </Device>\n",
+            "    </Devices>\n",
+            "  </Descriptions>\n",
+            "</EtherCATInfo>\n",
+        );
+        fs::write(&esi_path, esi_xml.as_bytes()).unwrap();
+
+        let app = parse_single_application_file(&esi_path, false).unwrap();
+        assert_eq!(
+            app.od.get(0x2001).unwrap().entry(0).unwrap().default_data,
+            "2A"
+        );
+        assert_eq!(
+            app.od.get(0x2002).unwrap().entry(0).unwrap().default_data,
+            "3412"
+        );
+        assert_eq!(
+            app.od.get(0x2003).unwrap().entry(0).unwrap().default_data,
+            "D4FE"
+        );
+        assert_eq!(
+            app.od.get(0x2004).unwrap().entry(0).unwrap().default_data,
+            "0807060504030201"
+        );
+
+        let eds_path = dir.join("MaxSub.eds");
+        let eds_txt = concat!(
+            "[2100]\nParameterName=BigRec\nObjectType=0x9\nSubNumber=2\n",
+            "[2100sub0]\nParameterName=Count\nDataType=0x0005\nAccessType=ro\nDefaultValue=255\n",
+            "[2100subff]\nParameterName=LastSub\nDataType=0x0006\nAccessType=rw\nDefaultValue=0xBEEF\n",
+        );
+        fs::write(&eds_path, eds_txt.as_bytes()).unwrap();
+        let eds_app = parse_single_application_file(&eds_path, false).unwrap();
+        assert_eq!(
+            eds_app
+                .od
+                .get(0x2100)
+                .unwrap()
+                .entry(255)
+                .unwrap()
+                .default_data,
+            "EFBE"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

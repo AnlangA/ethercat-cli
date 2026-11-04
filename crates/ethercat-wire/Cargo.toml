@@ -3,7 +3,7 @@ name = "ethercat-wire"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Low-level EtherCAT frame construction, Wireshark-compatible protocol dissector, PCAP/PCAPNG/PktMon streaming I/O, PDO bit codec, and L2 Npcap / UDP 34980 transport drivers"
+description = "Low-level EtherCAT frame construction, protocol constants, PCAP/PCAPNG/PktMon streaming I/O, PDO bit codec, and L2 Npcap / UDP 34980 transport drivers"
 
 [dependencies]
 clap.workspace = true

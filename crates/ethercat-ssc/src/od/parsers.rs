@@ -182,14 +182,32 @@ pub fn parse_application_files(
     paths: &[impl AsRef<Path>],
     strip_default_ssc_objects: bool,
 ) -> Result<SlaveApplication> {
+    parse_application_files_with_sheet(paths, strip_default_ssc_objects, None)
+}
+
+/// Parse one or more application / Object Dictionary input files with an optional `.xlsx` worksheet index,
+/// deferring automatic PDO / SyncManager object generation until all files' objects and modules are merged.
+pub fn parse_application_files_with_sheet(
+    paths: &[impl AsRef<Path>],
+    strip_default_ssc_objects: bool,
+    worksheet_index: Option<usize>,
+) -> Result<SlaveApplication> {
     if paths.is_empty() {
         return Err(CliError::SscInvalidData(
             "No application input files specified".to_string(),
         ));
     }
-    let mut base_app = parse_single_application_file(paths[0].as_ref(), strip_default_ssc_objects)?;
+    let mut base_app = parse_single_application_file_raw(
+        paths[0].as_ref(),
+        strip_default_ssc_objects,
+        worksheet_index,
+    )?;
     for extra in &paths[1..] {
-        let next_app = parse_single_application_file(extra.as_ref(), strip_default_ssc_objects)?;
+        let next_app = parse_single_application_file_raw(
+            extra.as_ref(),
+            strip_default_ssc_objects,
+            worksheet_index,
+        )?;
         for (_, obj) in next_app.od.objects {
             base_app.od.objects.insert(obj.index, obj);
         }
@@ -210,6 +228,19 @@ pub fn parse_single_application_file(
 /// Parse a single `.xlsx`, `.csv`, `.xml`, `.eds`, or `.tmc` file into `SlaveApplication`,
 /// optionally selecting a specific 0-based `.xlsx` worksheet index (`SSC OD Tool <SheetIdx>`).
 pub fn parse_single_application_file_with_sheet(
+    path: &Path,
+    strip_default_ssc_objects: bool,
+    worksheet_index: Option<usize>,
+) -> Result<SlaveApplication> {
+    let mut app =
+        parse_single_application_file_raw(path, strip_default_ssc_objects, worksheet_index)?;
+    app.od.finalize_and_validate(true);
+    Ok(app)
+}
+
+/// Parse a single application/OD file and finalize per-object layouts without auto-creating
+/// `0x1600`/`0x1A00`/`0x1C12`/`0x1C13` yet (used when merging multiple files).
+pub(crate) fn parse_single_application_file_raw(
     path: &Path,
     strip_default_ssc_objects: bool,
     worksheet_index: Option<usize>,
@@ -244,7 +275,7 @@ pub fn parse_single_application_file_with_sheet(
             app.od.remove(reserved);
         }
     }
-    app.od.finalize_and_validate(true);
+    app.od.finalize_and_validate(false);
     for module in &mut app.modules {
         module.od.finalize_and_validate(true);
     }
@@ -1655,7 +1686,7 @@ pub fn parse_dictionary_element(dict_el: &DomElement, name: &str) -> Result<Obje
                         let si0_flags = parse_esi_flags_element(sub_items[0].child("Flags"));
                         let si0_def = info_subitems
                             .first()
-                            .and_then(|si| extract_esi_info_default(si.child("Info")))
+                            .and_then(|si| extract_esi_info_default(si.child("Info"), 5, 8))
                             .unwrap_or_else(|| format!("{elem_count:02X}"));
                         obj.entries.push(EntryInfo {
                             sub_index: 0,
@@ -1673,7 +1704,13 @@ pub fn parse_dictionary_element(dict_el: &DomElement, name: &str) -> Result<Obje
                         for i in 1..=elem_count {
                             let info_si = info_subitems.get(i).copied();
                             let def_data = info_si
-                                .and_then(|si| extract_esi_info_default(si.child("Info")))
+                                .and_then(|si| {
+                                    extract_esi_info_default(
+                                        si.child("Info"),
+                                        elem_dt_id,
+                                        elem_bits,
+                                    )
+                                })
                                 .unwrap_or_default();
                             let si_name = info_si
                                 .and_then(|si| si.child_text("Name"))
@@ -1754,7 +1791,9 @@ pub fn parse_dictionary_element(dict_el: &DomElement, name: &str) -> Result<Obje
                             })
                             .unwrap_or_default();
                         let def_data = info_match
-                            .and_then(|isi| extract_esi_info_default(isi.child("Info")))
+                            .and_then(|isi| {
+                                extract_esi_info_default(isi.child("Info"), dt_id, final_bits)
+                            })
                             .unwrap_or_default();
                         obj.entries.push(EntryInfo {
                             sub_index: sub_idx,
@@ -1783,7 +1822,8 @@ pub fn parse_dictionary_element(dict_el: &DomElement, name: &str) -> Result<Obje
                 resolved_bits
             };
             let flags = parse_esi_flags_element(obj_el.child("Flags"));
-            let def_data = extract_esi_info_default(obj_el.child("Info")).unwrap_or_default();
+            let def_data = extract_esi_info_default(obj_el.child("Info"), dt_id, final_bits)
+                .unwrap_or_default();
             let mut obj = ObjectInfo::new(index, obj_name.clone(), ObjectCode::Variable);
             obj.category = cat;
             obj.depend_on_slot = depend_on_slot;
@@ -1879,7 +1919,11 @@ fn parse_esi_flags_element(flags_el: Option<&DomElement>) -> EntryFlags {
     }
 }
 
-fn extract_esi_info_default(info_el: Option<&DomElement>) -> Option<String> {
+fn extract_esi_info_default(
+    info_el: Option<&DomElement>,
+    dt_id: u16,
+    bit_len: i32,
+) -> Option<String> {
     let inf = info_el?;
     if let Some(dd) = inf.child_text("DefaultData") {
         return Some(dd.trim().to_string());
@@ -1892,8 +1936,35 @@ fn extract_esi_info_default(info_el: Option<&DomElement>) -> Option<String> {
         return Some(reverse_hex_byte_pairs(&hex));
     }
     if let Some(dv) = inf.child_text("DefaultValue") {
-        if let Some(u) = parse_u32_any(&dv) {
-            return Some(reverse_hex_byte_pairs(&format!("{u:08X}")));
+        let trimmed = dv.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let effective_bits = if bit_len > 0 {
+            bit_len
+        } else {
+            get_data_type(dt_id)
+                .map(|d| d.bit_length)
+                .unwrap_or(8)
+                .max(8)
+        };
+        let normalized = if dt_id != 9 {
+            if let Some(hx) = trimmed
+                .strip_prefix("#x")
+                .or_else(|| trimmed.strip_prefix("#X"))
+            {
+                format!("0x{hx}")
+            } else {
+                trimmed.to_string()
+            }
+        } else {
+            trimmed.to_string()
+        };
+        if let Ok(encoded) = convert_table_value_to_default_data(dt_id, effective_bits, &normalized)
+        {
+            if !encoded.is_empty() {
+                return Some(encoded);
+            }
         }
     }
     None
@@ -2003,7 +2074,7 @@ fn parse_eds_application(path: &Path) -> Result<SlaveApplication> {
                 ..Default::default()
             });
         } else {
-            for sub in 0u8..=254u8 {
+            for sub in 0u8..=255u8 {
                 let sub_key_lower = format!("{sec_name}sub{sub:x}");
                 let sub_key_upper = format!("{sec_name}sub{sub:X}");
                 let sub_key_dec = format!("{sec_name}sub{sub}");

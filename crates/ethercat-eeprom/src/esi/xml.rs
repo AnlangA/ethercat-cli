@@ -152,7 +152,10 @@ fn detect_prolog_encoding(raw: &[u8]) -> Option<String> {
 pub fn decode_xml_vec(raw: Vec<u8>) -> Result<String> {
     if raw.starts_with(&[0xEF, 0xBB, 0xBF]) {
         return match String::from_utf8(raw) {
-            Ok(s) => Ok(s),
+            Ok(mut s) => {
+                s.drain(..3);
+                Ok(s)
+            }
             Err(e) => Err(CliError::Format(format!(
                 "invalid UTF-8 XML with BOM: {}",
                 e.utf8_error()

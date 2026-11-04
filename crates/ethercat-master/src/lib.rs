@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use ethercat_dissector::decode_esc_register_payload;
 use ethercat_eeprom::sii::image::parse_sii_image;
 use ethercat_eeprom::sii::ops::{read_device_sii_image, SlaveSiiSummary};
 use ethercat_wire::error::{CliError, Result};
@@ -17,7 +18,6 @@ use ethercat_wire::protocol::constants::{
     al_state_name, al_status_code_description, resolve_esc_register, AlStateSpec, EcatCmd,
     EC_STATE_ERROR,
 };
-use ethercat_wire::protocol::dissector::decode_esc_register_payload;
 use ethercat_wire::types::{
     decode_typed_value, encode_typed_value, extract_bits_le, format_hex, is_decimal_float_literal,
     DataTypeSpec,

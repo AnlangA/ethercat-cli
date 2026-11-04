@@ -160,19 +160,25 @@ fn eeprom_wait_not_busy(
     aiadr: u16,
     timeout: Duration,
 ) -> Result<u16> {
-    let deadline = Instant::now() + timeout;
+    let start = Instant::now();
+    let deadline = start
+        .checked_add(timeout)
+        .unwrap_or_else(|| start + Duration::from_secs(3600));
     let mut first = true;
     loop {
         if !first {
             std::thread::sleep(Duration::from_micros(200));
         }
         first = false;
+        let step_timeout = timeout
+            .min(deadline.saturating_duration_since(Instant::now()))
+            .max(Duration::from_millis(1));
         let (wkc, buf) = bus.send_datagram(
             EcatCmd::Aprd,
             aiadr,
             ECT_REG_EEPSTAT,
             vec![0u8; 2],
-            Duration::from_millis(20),
+            step_timeout,
         )?;
         if wkc > 0 {
             let estat = u16::from_le_bytes([buf[0], buf[1]]);
@@ -201,7 +207,7 @@ fn read_eeprom_word_ap(
             aiadr,
             ECT_REG_EEPCTL,
             EC_ECMD_NOP.to_le_bytes().to_vec(),
-            Duration::from_millis(20),
+            timeout,
         );
     }
 
@@ -211,13 +217,7 @@ fn read_eeprom_word_ap(
         req.extend_from_slice(&EC_ECMD_READ.to_le_bytes());
         req.extend_from_slice(&word_addr.to_le_bytes());
 
-        let (wkc, _) = bus.send_datagram(
-            EcatCmd::Apwr,
-            aiadr,
-            ECT_REG_EEPCTL,
-            req,
-            Duration::from_millis(20),
-        )?;
+        let (wkc, _) = bus.send_datagram(EcatCmd::Apwr, aiadr, ECT_REG_EEPCTL, req, timeout)?;
         if wkc == 0 {
             return Err(CliError::Device(format!(
                 "EEPROM read command failed at word 0x{word_addr:06x} (WKC=0)"
@@ -241,7 +241,7 @@ fn read_eeprom_word_ap(
             aiadr,
             ECT_REG_EEPDAT,
             vec![0u8; read_len],
-            Duration::from_millis(20),
+            timeout,
         )?;
         if wkc_d == 0 {
             return Err(CliError::Device(format!(
@@ -268,7 +268,7 @@ fn write_eeprom_word_ap(
             aiadr,
             ECT_REG_EEPCTL,
             EC_ECMD_NOP.to_le_bytes().to_vec(),
-            Duration::from_millis(20),
+            timeout,
         );
     }
 
@@ -279,7 +279,7 @@ fn write_eeprom_word_ap(
             aiadr,
             ECT_REG_EEPDAT,
             word.to_le_bytes().to_vec(),
-            Duration::from_millis(20),
+            timeout,
         )?;
         if wkc_d == 0 {
             return Err(CliError::Device(format!(
@@ -290,13 +290,7 @@ fn write_eeprom_word_ap(
         let mut req = Vec::with_capacity(6);
         req.extend_from_slice(&EC_ECMD_WRITE.to_le_bytes());
         req.extend_from_slice(&word_addr.to_le_bytes());
-        let (wkc_c, _) = bus.send_datagram(
-            EcatCmd::Apwr,
-            aiadr,
-            ECT_REG_EEPCTL,
-            req,
-            Duration::from_millis(20),
-        )?;
+        let (wkc_c, _) = bus.send_datagram(EcatCmd::Apwr, aiadr, ECT_REG_EEPCTL, req, timeout)?;
         if wkc_c == 0 {
             return Err(CliError::Device(format!(
                 "EEPROM write command failed at word 0x{word_addr:06x}"
@@ -326,19 +320,13 @@ fn reload_eeprom_ap(bus: &mut dyn EthercatTransport, aiadr: u16, timeout: Durati
             aiadr,
             ECT_REG_EEPCTL,
             EC_ECMD_NOP.to_le_bytes().to_vec(),
-            Duration::from_millis(20),
+            timeout,
         );
     }
     let mut req = Vec::with_capacity(6);
     req.extend_from_slice(&EC_ECMD_RELOAD.to_le_bytes());
     req.extend_from_slice(&0u32.to_le_bytes());
-    let (wkc, _) = bus.send_datagram(
-        EcatCmd::Apwr,
-        aiadr,
-        ECT_REG_EEPCTL,
-        req,
-        Duration::from_millis(20),
-    )?;
+    let (wkc, _) = bus.send_datagram(EcatCmd::Apwr, aiadr, ECT_REG_EEPCTL, req, timeout)?;
     if wkc == 0 {
         return Err(CliError::Device(
             "EEPROM RELOAD command returned WKC=0".into(),

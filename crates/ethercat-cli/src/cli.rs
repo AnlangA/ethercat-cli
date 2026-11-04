@@ -304,24 +304,27 @@ Supports discovering `RxPDO` (outputs) and `TxPDO` (inputs) bit layouts from liv
     )]
     Datagram(DatagramArgs),
 
-    /// [OFFLINE] Dissect EtherCAT frames from hex, `.pcap`, `.pcapng`, Windows PktMon `.txt`, or `.bin` using Beckhoff/Wireshark field names.
+    /// [OFFLINE] Dissect EtherCAT frames from hex, `.pcap`, `.pcapng`, Windows PktMon `.txt`, or `.bin` using Wireshark 4.6 field names and optional `--xml` SDO/temporal PDO enrichment.
     #[command(
-        long_about = "[OFFLINE] Deep-packet EtherCAT protocol dissector modeled on Wireshark's built-in Beckhoff EtherCAT plugin.\n\n\
+        long_about = "[OFFLINE] Deep-packet EtherCAT protocol dissector implementing 100% of the official Wireshark 4.6 EtherCAT plugin (`esl`, `ecatf`, `ecat`, `ecat_mailbox`, `ams`, `tc_nv`, `ioraw`) plus XML-driven CoE SDO and stateful temporal PDO dissection.\n\n\
 Decodes:\n  \
-- Ethernet II (`0x88A4`), IEEE 802.1Q VLAN (`0x8100`), IPv4/UDP port `34980` (`0x88A4`), Beckhoff ET2000 EtherCAT Switch Link (`esl.*`), or headerless (`--bare`) frames\n  \
-- EtherCAT 2-byte Frame Header (`ecatf.*`): DLPDU (`0x1`), Network Variables (`0x4`, `nv.*`), Direct Mailbox (`0x5`)\n  \
-- Chained DLPDU subframes (`ecat.*` & `ecat[i].*`): command, idx, ADP/ADO/LAD, slave hint, C/M (`circulating`/`next`) flags, IRQ event bits, WKC\n  \
-- ESC Hardware Register bitfields (`ecat.reg.*` & `ecat[i].reg.*`): `0x0000..0x0009` ESC info/features, `0x0010`/`0x0012` station/alias, `0x0110..0x0134` DL/AL, `0x0300..0x0313` error counters, `0x0400..0x0443` watchdogs, `0x0500..0x0502` SII, `0x0600+` FMMU, `0x0800+` SyncM, `0x0900..0x09AF` Distributed Clocks\n  \
-- Mailbox protocols (`ecat_mailbox.*` & `ecat_mailbox[i].*`): CoE (Emergency, SDO Expedited/Normal/Segmented/Abort, SDO Info OD, CoE PDO), FoE, SoE, AoE (ADS), EoE (IP/Ethernet), VoE, ERR\n  \
-- Cyclic PDO fields (`ecat.pdo.*` & `ecat[i].pdo.*`) when `--pdo-layout` or `--sii-pdo` is supplied.",
-        after_long_help = "SUPPORTED FILE FORMATS (`--file` / `--input`):\n  - `.pcap`   : Standard libpcap capture (streamed incrementally; microsecond & nanosecond magic, LE/BE)\n  - `.pcapng` : Wireshark PCAP-NG capture (streamed multi-section SHB/IDB/EPB/SPB, LE/BE, `if_tsresol`)\n  - `.txt`    : Microsoft-Windows-PktMon hex dump logs (UTF-16LE/BE BOM or UTF-8)\n  - `.hex`    : Whitespace/colon/0x-delimited hexadecimal frame text\n  - `.bin`    : Raw binary Ethernet/EtherCAT frame bytes\n\nEXAMPLES:\n  # Dissect a single hex frame and extract Wireshark fields\n  ethercat-cli dissect --hex \"ffffffffffff01010101010188a4101007010000000004000000000000000000\" -f ecat.cmd -f ecat.ado_name\n\n  # Dissect first 5 frames of a Windows PktMon or Wireshark .pcapng capture in JSON\n  ethercat-cli --format json dissect --file ethercat-scan.txt --limit 5\n\n  # Decode cyclic LRW PDO fields inside a capture using an SII EEPROM dump\n  ethercat-cli dissect --file trace.pcapng --sii-pdo slave1.bin --pdo-dir tx -f ecat.pdo.0x6041:00"
+- Encapsulations: Ethernet II (`0x88A4`), IEEE 802.1Q/802.1ad VLAN, IPv4/UDP `34980` (`0x88A4`), Beckhoff ET2000 ESL (`esl.*` prefix & trailer), AMS/TCP (`48898`) & AMS/UDP (`48899`), or headerless (`--bare`)\n  \
+- EtherCAT 2-byte Frame Header (`ecatf.*`): DLPDU (`0x1`), Direct ADS/AMS (`0x2`, `ams.*`), Raw-IO (`0x3`, `ioraw.*`), TwinCAT Network Variables (`0x4`, `tc_nv.*` / `nv.*`), Direct Mailbox (`0x5`, `ecat_mailbox.*`)\n  \
+- Chained DLPDU subframes (`ecat.*`, `ecat[i].*`, `ecat.sub1..10.*`): command, idx, ADP/ADO/LAD, C/M (`circulating`/`next`), IRQ bits, WKC, and Distributed Clocks `0x0910` `ARMW`/`FRMW` difference (`ecat.dc.dif.*`)\n  \
+- ESC Hardware Registers (`ecat.reg.*`, `ecat.fmmu.*`, `ecat.syncman.*`): `0x0000..0x09FF` bitfields across ESC info, station/alias, DL/AL, error counters, watchdogs, SII, FMMU0..15, SM0..15, and DC\n  \
+- Mailbox protocols (`ecat_mailbox.*` & `ecat_mailbox[i].*`): CoE (Emergency, SDO Expedited/Normal/Segmented/Block/Abort/CA, SDO Info `0x01..0x07`, CoE PDO), FoE (incl. `.efw` firmware blocks), SoE, AoE/ADS (incl. CoE-over-AoE `0xF302`), EoE (IP params, MAC filter, Ethernet fragments), VoE, ERR\n  \
+- XML SDO & Temporal PDO (`--xml <ESI_OD_OR_ENI_XML>`, repeatable for multi-slave topologies):\n    \
+* CoE SDO Expedited/Normal/Segmented/Block reassembly resolved against `<EtherCATInfo>`, `<EtherCATDict>`, or `<EtherCATConfig>` (`ecat_mailbox.coe.sdo.xml.*`, `ecat_mailbox.coe.sdo.reassembled_data`)\n    \
+* Automatic per-slave XML profile matching via SII EEPROM reads (`0x0502..0x050F`), CoE `0x1018` Identity SDOs, station addresses (`0x0010` / ENI `<PhysAddr>`), and MDP `0xF030` module slots\n    \
+* Stateful temporal PDO tracking across packet sequence (`0x1600..0x17FF`, `0x1A00..0x1BFF`, `0x1C12`, `0x1C13`, ESC SM `0x0800+`, FMMU `0x0600+`): cyclic PDO frames occurring BEFORE PDO configuration frames in the trace are intentionally NOT decoded into XML PDO fields; PDO frames AFTER configuration decode exact mapped XML fields (`ecat.pdo.*`).",
+        after_long_help = "SUPPORTED FILE FORMATS (`--file` / `--input`):\n  - `.pcap`   : Standard libpcap capture (streamed incrementally; microsecond & nanosecond magic, LE/BE)\n  - `.pcapng` : Wireshark PCAP-NG capture (streamed multi-section SHB/IDB/EPB/SPB, LE/BE, `if_tsresol`)\n  - `.txt`    : Microsoft-Windows-PktMon hex dump logs (UTF-16LE/BE BOM or UTF-8)\n  - `.hex`    : Whitespace/colon/0x-delimited hexadecimal frame text\n  - `.bin`    : Raw binary Ethernet/EtherCAT frame bytes\n\nEXAMPLES:\n  # Dissect a single hex frame and extract Wireshark fields\n  ethercat-cli dissect --hex \"ffffffffffff01010101010188a4101007010000000004000000000000000000\" -f ecat.cmd -f ecat.ado_name\n\n  # Dissect a multi-slave startup + cyclic trace with multiple ESI/OD/ENI XML files\n  ethercat-cli --format json dissect --file startup_and_op.pcapng --xml ./esi/EL2004.xml --xml ./esi/ServoDrive.xml --limit 0\n\n  # Decode cyclic LRW PDO fields inside a mid-stream capture using a static SII EEPROM dump\n  ethercat-cli dissect --file trace.pcapng --sii-pdo slave1.bin --pdo-dir tx -f ecat.pdo.0x6041:00"
     )]
     Dissect(DissectArgs),
 
     /// [READ-ONLY] Capture live `0x88A4` EtherCAT frames from `--iface`, dissect in real time, and optionally save to `.pcap` / `.pcapng`.
     #[command(
-        long_about = "[READ-ONLY] Passively capture live EtherCAT (`0x88A4`) Ethernet frames from `--iface` via Npcap/libpcap (promiscuous mode), dissect each frame using the Beckhoff/Wireshark dissector, apply optional command/field filters, and optionally write a standard `.pcap` or `.pcapng` file.",
-        after_long_help = "EXAMPLES:\n  # Capture up to 20 EtherCAT frames over 3 seconds and save to trace.pcapng\n  ethercat-cli -i \"\\Device\\NPF_{GUID}\" capture --count 20 --duration-ms 3000 --save-pcap trace.pcapng\n\n  # Capture only LRW frames and print WKC + logical address\n  ethercat-cli -i \"\\Device\\NPF_{GUID}\" capture --count 10 --filter-cmd lrw -f ecat.lad -f ecat.wkc"
+        long_about = "[READ-ONLY] Passively capture live EtherCAT (`0x88A4`) Ethernet frames from `--iface` via Npcap/libpcap (promiscuous mode), dissect each frame through a stateful Wireshark 4.6 dissector session (with optional repeatable `--xml` SDO/temporal PDO decoding), apply optional command/field filters, and optionally write a `.pcap` or `.pcapng` file.",
+        after_long_help = "EXAMPLES:\n  # Capture up to 20 EtherCAT frames over 3 seconds and save to trace.pcapng\n  ethercat-cli -i \"\\Device\\NPF_{GUID}\" capture --count 20 --duration-ms 3000 --save-pcap trace.pcapng\n\n  # Capture with ESI XML enrichment for live CoE SDO and post-config PDO decoding\n  ethercat-cli -i \"\\Device\\NPF_{GUID}\" capture --count 100 --xml ./esi/ --save-pcap startup.pcapng"
     )]
     Capture {
         /// Maximum number of matching EtherCAT packets to capture before stopping.
@@ -343,6 +346,14 @@ Decodes:\n  \
         /// Optional SII `.bin` file to decode `TxPDO`/`RxPDO` fields during live capture.
         #[arg(long, value_name = "FILE")]
         sii_pdo: Option<PathBuf>,
+
+        /// Repeatable ETG.2000 ESI `<EtherCATInfo>`, Offline OD `<EtherCATDict>`, or ETG.2100 ENI `<EtherCATConfig>` `.xml` file or directory for live SDO & stateful temporal PDO dissection.
+        #[arg(long = "xml", value_name = "XML_OR_DIR")]
+        xml: Vec<PathBuf>,
+
+        /// Optional device selector (`<Type>`, `<Name>`, `ProductCode`, or index) when `--xml` contains multiple `<Device>` profiles.
+        #[arg(long, value_name = "DEVICE")]
+        xml_device: Option<String>,
 
         /// Save raw captured Ethernet frames to a Wireshark-compatible `.pcap` or `.pcapng` file (selected by extension).
         #[arg(long, value_name = "PCAP_OUT")]
@@ -1264,6 +1275,14 @@ pub struct DissectArgs {
     /// Direction (`tx` or `rx`) when loading PDO layout from `--sii-pdo`.
     #[arg(long, default_value = "tx", value_name = "tx|rx")]
     pub pdo_dir: String,
+
+    /// Repeatable ETG.2000 ESI `<EtherCATInfo>`, Offline OD `<EtherCATDict>`, or ETG.2100 ENI `<EtherCATConfig>` `.xml` file or directory for XML-driven CoE SDO decoding (`ecat_mailbox.coe.sdo.xml.*`) and stateful temporal PDO dissection (`ecat.pdo.*` only on cyclic frames appearing AFTER PDO configuration packets in the capture).
+    #[arg(long = "xml", value_name = "XML_OR_DIR")]
+    pub xml: Vec<PathBuf>,
+
+    /// Optional device selector (`<Type>`, `<Name>`, `ProductCode`, or 0-based index) when `--xml` contains multiple `<Device>` profiles and trace packets do not carry SII (`0x0508`) or `0x1018` identity reads.
+    #[arg(long, value_name = "DEVICE")]
+    pub xml_device: Option<String>,
 }
 
 pub fn parse_ssc_define_kv(raw: &str) -> std::result::Result<(String, String), String> {

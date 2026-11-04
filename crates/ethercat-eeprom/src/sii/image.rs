@@ -83,18 +83,17 @@ pub struct WordDiff {
 }
 
 pub fn sii_count_different_words(current: &[u8], proposed: &[u8]) -> usize {
+    let max_words = current.len().max(proposed.len()).div_ceil(2);
     let mut diff = 0usize;
-    let mut i = 0usize;
-    while i + 1 < proposed.len() {
-        if i + 1 >= current.len() || current[i] != proposed[i] || current[i + 1] != proposed[i + 1]
-        {
-            diff += 1;
-        }
-        i += 2;
-    }
-    if !proposed.len().is_multiple_of(2) {
-        let last = proposed.len() - 1;
-        if current.get(last).copied() != Some(proposed[last]) {
+    for word_addr in 0..max_words {
+        let i = word_addr * 2;
+        let ls = current
+            .get(i..current.len().min(i + 2))
+            .filter(|s| !s.is_empty());
+        let rs = proposed
+            .get(i..proposed.len().min(i + 2))
+            .filter(|s| !s.is_empty());
+        if ls != rs {
             diff += 1;
         }
     }
@@ -102,33 +101,26 @@ pub fn sii_count_different_words(current: &[u8], proposed: &[u8]) -> usize {
 }
 
 pub fn sii_diff_words(left: &[u8], right: &[u8], max_details: usize) -> (usize, Vec<WordDiff>) {
-    let max_len = left.len().max(right.len());
+    let max_words = left.len().max(right.len()).div_ceil(2);
     let mut total = 0usize;
     let mut details = Vec::new();
-    let mut i = 0usize;
-    while i + 1 < max_len {
-        let lw = if i + 1 < left.len() {
-            Some(sii_le16(&left[i..i + 2]))
-        } else {
-            None
-        };
-        let rw = if i + 1 < right.len() {
-            Some(sii_le16(&right[i..i + 2]))
-        } else {
-            None
-        };
-        if lw != rw {
+    for word_addr in 0..max_words {
+        let i = word_addr * 2;
+        let ls = left.get(i..left.len().min(i + 2)).filter(|s| !s.is_empty());
+        let rs = right
+            .get(i..right.len().min(i + 2))
+            .filter(|s| !s.is_empty());
+        if ls != rs {
             total += 1;
             if details.len() < max_details {
                 details.push(WordDiff {
-                    word_addr: i / 2,
+                    word_addr,
                     byte_offset: format!("0x{i:04x}"),
-                    left_word: lw.map(|w| format!("0x{w:04x}")),
-                    right_word: rw.map(|w| format!("0x{w:04x}")),
+                    left_word: ls.map(|s| format!("0x{:04x}", sii_le16(s))),
+                    right_word: rs.map(|s| format!("0x{:04x}", sii_le16(s))),
                 });
             }
         }
-        i += 2;
     }
     (total, details)
 }
@@ -231,7 +223,7 @@ pub struct SiiPdoEntryDecoded {
     pub subindex: u8,
     pub name_idx: u8,
     pub name: Option<String>,
-    pub data_type: u8,
+    pub data_type: u16,
     pub data_type_name: &'static str,
     pub bit_length: u8,
     pub bit_offset: usize,
@@ -675,7 +667,7 @@ fn parse_pdo_category(
                 } else {
                     strings.get((e_name_idx as usize) - 1).cloned()
                 },
-                data_type: e_dt,
+                data_type: e_dt as u16,
                 data_type_name: ect_datatype_name(e_dt as u16),
                 bit_length: e_bit_len,
                 bit_offset: bit_off,
@@ -1535,9 +1527,8 @@ pub fn sii_pdos_to_layout(pdos: &[SiiPdoDecoded]) -> ethercat_wire::pdo_codec::P
                 .clone()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| entry_id.clone());
-            let ty =
-                DataTypeSpec::from_coe_datatype(entry.data_type as u16, entry.bit_length as u16)
-                    .unwrap_or_else(|| DataTypeSpec::from_ect_code(entry.data_type as u16));
+            let ty = DataTypeSpec::from_coe_datatype(entry.data_type, entry.bit_length as u16)
+                .unwrap_or_else(|| DataTypeSpec::from_ect_code(entry.data_type));
             fields.push(PdoFieldDef {
                 name,
                 entry_id: Some(entry_id),

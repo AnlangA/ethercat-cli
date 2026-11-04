@@ -9,6 +9,7 @@ use crate::commands::execute_cli;
 use crate::commands::frames::{handle_dissect, parse_subframe_spec};
 use crate::commands::ssc::handle_ssc;
 use crate::selector::apply_field_selectors;
+use ethercat_dissector::{dissect_frame, dissect_mailbox, DissectOptions};
 use ethercat_eeprom::sii::image::{patch_sii_image, sii_validate, SiiPatchSpec};
 use ethercat_eeprom::sii::ops::{
     inspect_sii_data, read_device_sii_slice, write_device_sii_guarded, GuardedSiiWriteOptions,
@@ -24,15 +25,14 @@ use ethercat_master::{
 };
 use ethercat_wire::error::CliError;
 use ethercat_wire::protocol::constants::{AlStateSpec, EcatCmd};
-use ethercat_wire::protocol::dissector::{dissect_frame, DissectOptions};
 use ethercat_wire::protocol::frame::{parse_dlpdu_datagrams, EcatFrameBuilder, RawDatagram};
 use ethercat_wire::protocol::pcap_io::{
     for_each_frame_in_file, load_frames_from_file, write_pcap_file, FrameInputKind,
 };
+use ethercat_wire::types;
 use ethercat_wire::types::{
     decode_typed_value, encode_typed_value, extract_bits_le, format_hex, DataTypeSpec,
 };
-use ethercat_wire::{protocol, types};
 
 fn unique_temp_id() -> String {
     static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
@@ -317,23 +317,28 @@ fn wireshark_dissector_selectors_multi_subframe_mailbox_and_streaming_pcap() {
     // Beckhoff ET2000 ESL prefix & trailer dissection
     let mut esl_tag = [0u8; 16];
     esl_tag[0..6].copy_from_slice(&[0x01, 0x01, 0x05, 0x10, 0x00, 0x00]);
-    esl_tag[6..8].copy_from_slice(&0x2840u16.to_le_bytes()); // ts_enable | crc_error | port 1
+    esl_tag[6..8].copy_from_slice(&0x3040u16.to_le_bytes()); // ts_enable (0x2000) | crc_error (0x1000) | port 1 (0x0040)
     esl_tag[8..16].copy_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
     let mut esl_prefix = esl_tag.to_vec();
     esl_prefix.extend_from_slice(&raw_frame);
     let esl_p_df = dissect_frame(&esl_prefix, &DissectOptions::default()).unwrap();
     assert_eq!(esl_p_df.wireshark_fields["esl.port"], 1);
     assert_eq!(esl_p_df.wireshark_fields["esl.crcerror"], true);
+    assert_eq!(esl_p_df.wireshark_fields["esl.alignerror"], false);
     assert_eq!(esl_p_df.wireshark_fields["esl.tsenable"], true);
     assert_eq!(
         esl_p_df.wireshark_fields["esl.timestamp"],
         0x0102_0304_0506_0708u64
     );
+    let mut esl_trailer_tag = esl_tag;
+    esl_trailer_tag[6..8].copy_from_slice(&0x2840u16.to_le_bytes()); // ts_enable (0x2000) | align_error (0x0800) | port 1 (0x0040)
     let mut esl_trailer = raw_frame.clone();
-    esl_trailer.extend_from_slice(&esl_tag);
+    esl_trailer.extend_from_slice(&esl_trailer_tag);
     let esl_t_df = dissect_frame(&esl_trailer, &DissectOptions::default()).unwrap();
     assert_eq!(esl_t_df.esl.as_ref().unwrap().position, "trailer");
     assert_eq!(esl_t_df.wireshark_fields["esl.port"], 1);
+    assert_eq!(esl_t_df.wireshark_fields["esl.crcerror"], false);
+    assert_eq!(esl_t_df.wireshark_fields["esl.alignerror"], true);
 
     // Expanded ESC register dissection: 0x0000 (10B), 0x0300, 0x0440, 0x0600, 0x0805, 0x092C (sign-magnitude -100ns)
     let mut esc_b = EcatFrameBuilder::new();
@@ -553,6 +558,8 @@ fn wireshark_dissector_selectors_multi_subframe_mailbox_and_streaming_pcap() {
             pdo_layout: None,
             sii_pdo: None,
             pdo_dir: "tx".into(),
+            xml: Vec::new(),
+            xml_device: None,
         })
         .unwrap();
         assert_eq!(dissect_rep.json["dissected_count"], 1);
@@ -1086,15 +1093,13 @@ fn boundary_and_malformed_input_edge_cases() {
     let mut ws = std::collections::BTreeMap::new();
     let mut sdo_abort_mbx = vec![10, 0, 0, 0, 0, 0x13, 0x03, 0x20, 0x80, 0x18, 0x10, 0x01];
     sdo_abort_mbx.extend_from_slice(&0x0602_0000u32.to_le_bytes());
-    let abort_d =
-        protocol::mailbox::dissect_mailbox(&sdo_abort_mbx, &mut ws, "ecat_mailbox").unwrap();
+    let abort_d = dissect_mailbox(&sdo_abort_mbx, &mut ws, "ecat_mailbox").unwrap();
     assert_eq!(abort_d.protocol["number"], 3);
     let sdo_noseg_mbx = vec![
         14, 0, 0, 0, 0, 0x13, 0x00, 0x20, 0x20, 0x00, 0x20, 0x00, 0, 0, 0, 0, 0xDE, 0xAD, 0xBE,
         0xEF,
     ];
-    let noseg_d =
-        protocol::mailbox::dissect_mailbox(&sdo_noseg_mbx, &mut ws, "ecat_mailbox").unwrap();
+    let noseg_d = dissect_mailbox(&sdo_noseg_mbx, &mut ws, "ecat_mailbox").unwrap();
     assert_eq!(noseg_d.protocol["data_hex"], "deadbeef");
     assert_eq!(ws["ecat_mailbox.coe.sdo.data"], "deadbeef");
     let mut info06 = vec![0u8; 24];
@@ -1111,7 +1116,7 @@ fn boundary_and_malformed_input_edge_cases() {
     info06.extend_from_slice(b"Torque");
     let len_hdr = (info06.len() - 6) as u16;
     info06[0..2].copy_from_slice(&len_hdr.to_le_bytes());
-    let info06_d = protocol::mailbox::dissect_mailbox(&info06, &mut ws, "ecat_mailbox").unwrap();
+    let info06_d = dissect_mailbox(&info06, &mut ws, "ecat_mailbox").unwrap();
     assert_eq!(info06_d.protocol["name"], "Torque");
     assert_eq!(ws["ecat_mailbox.coe.sdoinfo.name"], "Torque");
 
@@ -2713,10 +2718,10 @@ fn ssc_pure_rust_end_to_end_smoke() {
 #[test]
 fn hardened_optimizations_and_edge_cases_regression() {
     use crate::cli::SscOdGenerateArgs;
+    use ethercat_dissector::may_contain_ethercat;
     use ethercat_ssc::model::SlaveProject;
     use ethercat_ssc::od::builtin_ods::build_project_object_dictionary;
     use ethercat_ssc::od::types::resolve_data_type_name;
-    use ethercat_wire::protocol::dissector::may_contain_ethercat;
     use ethercat_wire::types::{insert_bits_le, parse_u16, parse_u64};
 
     // 1. ETG.2000 `#x` / `#X` hex literals + BITARR / DWORD CoE types + bit-slice fast paths & overflow guards
@@ -3469,6 +3474,824 @@ fn ssc_full_decompilation_parity_suite() {
             .join("BadMdpAppObjects.h")
             .is_file(),
         "default src_dir must fall back to <InputDir>/output when <InputDir>/Src does not exist"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn cli_dissect_xml_sdo_and_temporal_pdo_sequence() {
+    let tmp = std::env::temp_dir().join(format!("ethercat-cli-xml-dissect-{}", unique_temp_id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    let esi_xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<EtherCATInfo>
+  <Descriptions>
+    <Devices>
+      <Device>
+        <Type ProductCode="#x00001111" RevisionNo="#x00010000">DUMMY-IO</Type>
+        <Name>Dummy IO Terminal</Name>
+      </Device>
+      <Device>
+        <Type ProductCode="#x1C2B3052" RevisionNo="#x00120000">EL7211-B</Type>
+        <Name>EL7211 Servo Terminal</Name>
+        <Profile>
+          <Dictionary>
+            <DataTypes>
+              <DataType>
+                <Name>UINT16</Name>
+                <BitSize>16</BitSize>
+              </DataType>
+              <DataType>
+                <Name>DINT</Name>
+                <BitSize>32</BitSize>
+              </DataType>
+              <DataType>
+                <Name>OP_MODE_ENUM</Name>
+                <BaseType>SINT</BaseType>
+                <BitSize>8</BitSize>
+                <EnumInfo><Text>PP</Text><Enum>1</Enum></EnumInfo>
+                <EnumInfo><Text>CSP</Text><Enum>8</Enum></EnumInfo>
+              </DataType>
+            </DataTypes>
+            <Objects>
+              <Object>
+                <Index>#x6040</Index>
+                <Name>Controlword</Name>
+                <Type>UINT16</Type>
+                <BitSize>16</BitSize>
+              </Object>
+              <Object>
+                <Index>#x6041</Index>
+                <Name>Statusword</Name>
+                <Type>UINT16</Type>
+                <BitSize>16</BitSize>
+              </Object>
+              <Object>
+                <Index>#x6060</Index>
+                <Name>Modes_of_Operation</Name>
+                <Type>OP_MODE_ENUM</Type>
+                <BitSize>8</BitSize>
+              </Object>
+              <Object>
+                <Index>#x607A</Index>
+                <Name>Target_Position</Name>
+                <Type>DINT</Type>
+                <BitSize>32</BitSize>
+              </Object>
+              <Object>
+                <Index>#x6064</Index>
+                <Name>Position_Actual_Value</Name>
+                <Type>DINT</Type>
+                <BitSize>32</BitSize>
+              </Object>
+            </Objects>
+          </Dictionary>
+        </Profile>
+        <RxPdo Fixed="true">
+          <Index>#x1600</Index>
+          <Name>DRV RxPDO-Map</Name>
+          <Entry>
+            <Index>#x6040</Index>
+            <SubIndex>0</SubIndex>
+            <BitLen>16</BitLen>
+            <Name>Controlword</Name>
+            <DataType>UINT16</DataType>
+          </Entry>
+          <Entry>
+            <Index>#x607A</Index>
+            <SubIndex>0</SubIndex>
+            <BitLen>32</BitLen>
+            <Name>Target_Position</Name>
+            <DataType>DINT</DataType>
+          </Entry>
+        </RxPdo>
+        <TxPdo Fixed="true">
+          <Index>#x1A00</Index>
+          <Name>DRV TxPDO-Map</Name>
+          <Entry>
+            <Index>#x6041</Index>
+            <SubIndex>0</SubIndex>
+            <BitLen>16</BitLen>
+            <Name>Statusword</Name>
+            <DataType>UINT16</DataType>
+          </Entry>
+          <Entry>
+            <Index>#x6064</Index>
+            <SubIndex>0</SubIndex>
+            <BitLen>32</BitLen>
+            <Name>Position_Actual_Value</Name>
+            <DataType>DINT</DataType>
+          </Entry>
+        </TxPdo>
+      </Device>
+    </Devices>
+  </Descriptions>
+</EtherCATInfo>
+"##;
+
+    let xml_path = tmp.join("el7211.xml");
+    std::fs::write(&xml_path, esi_xml).unwrap();
+
+    let build_coe_sdo_frame = |cnt: u8, sdo_hdr_and_body: &[u8]| -> Vec<u8> {
+        let coe_len = 2 + sdo_hdr_and_body.len();
+        let mut mbx = Vec::with_capacity(6 + coe_len);
+        mbx.extend_from_slice(&(coe_len as u16).to_le_bytes());
+        mbx.extend_from_slice(&0x0000u16.to_le_bytes());
+        mbx.push(0x00);
+        mbx.push((cnt << 4) | 0x03); // CoE
+        mbx.extend_from_slice(&0x2000u16.to_le_bytes()); // service=0x02 (SDO Req)
+        mbx.extend_from_slice(sdo_hdr_and_body);
+        let mut dg = RawDatagram::new_positioned(EcatCmd::Fpwr, cnt, 0x1001, 0x1000, mbx);
+        dg.wkc = 1;
+        let mut b = EcatFrameBuilder::new();
+        b.add_datagram(dg);
+        b.build().unwrap()
+    };
+
+    // Frame 0: Pre-configuration LWR -> MUST NOT decode PDO fields!
+    let mut pre_lwr = RawDatagram::new_logical(
+        EcatCmd::Lwr,
+        1,
+        0x0001_0000,
+        vec![0x0F, 0x00, 0x48, 0xE8, 0x01, 0x00],
+    );
+    pre_lwr.wkc = 1;
+    let mut b0 = EcatFrameBuilder::new();
+    b0.add_datagram(pre_lwr);
+    let f0 = b0.build().unwrap();
+
+    // Frame 1: APWR 0x0010 -> station address 0x1001
+    let mut apwr_st = RawDatagram::new_positioned(
+        EcatCmd::Apwr,
+        2,
+        0x0000,
+        0x0010,
+        0x1001u16.to_le_bytes().to_vec(),
+    );
+    apwr_st.wkc = 1;
+    let mut b1 = EcatFrameBuilder::new();
+    b1.add_datagram(apwr_st);
+    let f1 = b1.build().unwrap();
+
+    // Frame 2: Expedited SDO Download 0x6060:00 = 8 (CSP)
+    let f2 = build_coe_sdo_frame(1, &[0x2F, 0x60, 0x60, 0x00, 8, 0, 0, 0]);
+
+    // Frame 3: Complete Access (CA=1) SDO Download 0x1C12 -> [count=1, 0x1600]
+    let f3 = build_coe_sdo_frame(
+        2,
+        &[
+            0x31, 0x12, 0x1C, 0x00, // normal + size_ind + CA=1 (0x20|0x10|0x01 = 0x31)
+            4, 0, 0, 0, // 4 bytes
+            1, 0, // sub0 count = 1
+            0x00, 0x16, // sub1 = 0x1600
+        ],
+    );
+
+    // Frame 4: Complete Access (CA=1) SDO Download 0x1C13 -> [count=1, 0x1A00]
+    let f4 = build_coe_sdo_frame(3, &[0x31, 0x13, 0x1C, 0x00, 4, 0, 0, 0, 1, 0, 0x00, 0x1A]);
+
+    // Frame 5: Post-configuration LWR (Controlword=0x000F, Target_Position=125_000) + LRD (Statusword=0x1637, Position_Actual_Value=124_995)
+    let mut post_lwr = RawDatagram::new_logical(
+        EcatCmd::Lwr,
+        6,
+        0x0001_0000,
+        vec![0x0F, 0x00, 0x48, 0xE8, 0x01, 0x00],
+    );
+    post_lwr.wkc = 1;
+    let mut post_lrd = RawDatagram::new_logical(
+        EcatCmd::Lrd,
+        7,
+        0x0002_0000,
+        vec![0x37, 0x16, 0x43, 0xE8, 0x01, 0x00],
+    );
+    post_lrd.wkc = 1;
+    let mut b5 = EcatFrameBuilder::new();
+    b5.add_datagram(post_lwr);
+    b5.add_datagram(post_lrd);
+    let f5 = b5.build().unwrap();
+
+    let pcap_path = tmp.join("temporal_pdo.pcap");
+    write_pcap_file(
+        &pcap_path,
+        &[
+            (1_000, f0),
+            (2_000, f1),
+            (3_000, f2),
+            (4_000, f3),
+            (5_000, f4),
+            (6_000, f5),
+        ],
+    )
+    .unwrap();
+
+    let cli = Cli::try_parse_from([
+        "ethercat-cli",
+        "--format",
+        "json",
+        "dissect",
+        "--file",
+        pcap_path.to_str().unwrap(),
+        "--xml",
+        xml_path.to_str().unwrap(),
+        "--xml-device",
+        "EL7211-B",
+    ])
+    .expect("parse dissect --xml CLI args");
+
+    let rendered = execute_cli(&cli).expect("execute dissect --xml");
+    assert_eq!(rendered.json["dissected_count"], 6);
+
+    // 1. Pre-configuration Frame 0 MUST NOT decode XML PDO fields
+    let fr0 = &rendered.json["frames"][0]["frame"];
+    assert!(fr0["datagrams"][0].get("pdo_fields").is_none());
+    assert!(
+        !fr0["wireshark_fields"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .any(|k| k.starts_with("ecat.pdo.")),
+        "pre-config frame must not contain ecat.pdo.* fields"
+    );
+
+    // 2. SDO Frame 2 MUST decode XML object name + enum text "CSP"
+    let fr2 = &rendered.json["frames"][2]["frame"];
+    assert_eq!(
+        fr2["wireshark_fields"]["ecat_mailbox.coe.sdo.xml.object_name"],
+        "Modes_of_Operation"
+    );
+    assert_eq!(
+        fr2["wireshark_fields"]["ecat_mailbox.coe.sdo.xml.enum_text"],
+        "CSP"
+    );
+    assert!(rendered.text.contains("Modes_of_Operation=8"));
+
+    // 3. Post-configuration Frame 5 MUST decode both RxPDO and TxPDO fields from XML
+    let fr5 = &rendered.json["frames"][5]["frame"];
+    assert_eq!(fr5["wireshark_fields"]["ecat.pdo.Controlword"], 15);
+    assert_eq!(fr5["wireshark_fields"]["ecat.pdo.Target_Position"], 125_000);
+    assert_eq!(fr5["wireshark_fields"]["ecat.pdo.Statusword"], 0x1637);
+    assert_eq!(
+        fr5["wireshark_fields"]["ecat.pdo.Position_Actual_Value"],
+        124_995
+    );
+
+    // 4. Verify `-f / --field` Wireshark selector projection across multi-packet PCAP
+    let selected = apply_field_selectors(
+        &rendered.json,
+        &[
+            "ecat_mailbox.coe.sdo.xml.enum_text".to_string(),
+            "ecat.pdo.Target_Position".to_string(),
+        ],
+    )
+    .expect("select XML SDO and temporal PDO fields");
+    let rows = selected.as_array().expect("projected packet array");
+    assert_eq!(rows.len(), 2, "only SDO Frame #2 and post-config PDO Frame #5 must match (NOT pre-config Frame #0): {selected}");
+    assert_eq!(rows[0]["index"], 2);
+    assert_eq!(
+        rows[0]["fields"]["ecat_mailbox.coe.sdo.xml.enum_text"],
+        "CSP"
+    );
+    assert_eq!(rows[1]["index"], 5);
+    assert_eq!(rows[1]["fields"]["ecat.pdo.Target_Position"], 125_000);
+
+    // 5. Verify `fields` catalog includes new Wireshark 4.6 + XML SDO selectors
+    let cli_fields = Cli::try_parse_from([
+        "ethercat-cli",
+        "--format",
+        "json",
+        "fields",
+        "--category",
+        "wireshark",
+        "--search",
+        "sdo.xml",
+    ])
+    .unwrap();
+    let fields_rendered = execute_cli(&cli_fields).unwrap();
+    assert!(!fields_rendered.json["wireshark_selectors"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    // 6. Repeatable `--xml slave_a.xml --xml slave_b.xml` + SII EEPROM `0x0502..0x050F` multi-slave discovery
+    //    (without `0x1018` SDOs and without `--xml-device`):
+    let xml_a_path = tmp.join("slave_a.xml");
+    let xml_b_path = tmp.join("slave_b.xml");
+    std::fs::write(
+        &xml_a_path,
+        r##"<?xml version="1.0" encoding="UTF-8"?>
+<EtherCATInfo>
+  <Vendor><Id>2</Id></Vendor>
+  <Descriptions><Devices><Device>
+    <Type ProductCode="#x11113052" RevisionNo="#x00010000">SlaveA</Type>
+    <Sm StartAddress="#x0F00" ControlByte="#x44" Enable="1">Outputs</Sm>
+    <RxPdo Fixed="1" Sm="0">
+      <Index>#x1600</Index><Name>OutA</Name>
+      <Entry><Index>#x7000</Index><SubIndex>1</SubIndex><BitLen>16</BitLen><Name>CmdA</Name><DataType>UINT</DataType></Entry>
+    </RxPdo>
+  </Device></Devices></Descriptions>
+</EtherCATInfo>"##,
+    )
+    .unwrap();
+    std::fs::write(
+        &xml_b_path,
+        r##"<?xml version="1.0" encoding="UTF-8"?>
+<EtherCATInfo>
+  <Vendor><Id>2</Id></Vendor>
+  <Descriptions><Devices><Device>
+    <Type ProductCode="#x22223052" RevisionNo="#x00010000">SlaveB</Type>
+    <Sm StartAddress="#x1100" ControlByte="#x20" Enable="1">Inputs</Sm>
+    <TxPdo Fixed="1" Sm="0">
+      <Index>#x1A00</Index><Name>InB</Name>
+      <Entry><Index>#x6000</Index><SubIndex>1</SubIndex><BitLen>16</BitLen><Name>FeedbackB</Name><DataType>UINT</DataType></Entry>
+    </TxPdo>
+  </Device></Devices></Descriptions>
+</EtherCATInfo>"##,
+    )
+    .unwrap();
+
+    let mut multi_frames: Vec<(u64, Vec<u8>)> = Vec::new();
+    // Frame 0: pre-config LRW -> must NOT decode
+    let mut dg_m0 = RawDatagram::new_logical(EcatCmd::Lrw, 1, 0x0005_0000, vec![0xAA; 4]);
+    dg_m0.wkc = 3;
+    let mut bm0 = EcatFrameBuilder::new();
+    bm0.add_datagram(dg_m0);
+    multi_frames.push((1_000_000, bm0.build().unwrap()));
+
+    // Frame 1: assign station 0x1001 & 0x1002 + SII EEPROM read word 8 (`VendorId` + `ProductCode`)
+    let mut bm1 = EcatFrameBuilder::new();
+    for (slot_i, stadr, prod) in [
+        (0u16, 0x1001u16, 0x1111_3052u32),
+        (1u16, 0x1002u16, 0x2222_3052u32),
+    ] {
+        let mut dg_st = RawDatagram::new_positioned(
+            EcatCmd::Apwr,
+            1,
+            (0u16).wrapping_sub(slot_i),
+            0x0010,
+            stadr.to_le_bytes().to_vec(),
+        );
+        dg_st.wkc = 1;
+        let mut sii_w = vec![0x00, 0x01];
+        sii_w.extend_from_slice(&8u32.to_le_bytes());
+        let mut dg_sw = RawDatagram::new_positioned(EcatCmd::Fpwr, 2, stadr, 0x0502, sii_w);
+        dg_sw.wkc = 1;
+        let mut sii_r = vec![0x40, 0x00, 0, 0, 0, 0];
+        sii_r.extend_from_slice(&2u32.to_le_bytes());
+        sii_r.extend_from_slice(&prod.to_le_bytes());
+        let mut dg_sr = RawDatagram::new_positioned(EcatCmd::Fprd, 3, stadr, 0x0502, sii_r);
+        dg_sr.wkc = 1;
+        bm1.add_datagram(dg_st);
+        bm1.add_datagram(dg_sw);
+        bm1.add_datagram(dg_sr);
+    }
+    multi_frames.push((2_000_000, bm1.build().unwrap()));
+
+    // Frame 2: configure FMMU0 on 0x1001 (`0x00050000..+2` write) & 0x1002 (`0x00050002..+2` read)
+    let mut bm2 = EcatFrameBuilder::new();
+    let mut fa = vec![0u8; 16];
+    fa[0..4].copy_from_slice(&0x0005_0000u32.to_le_bytes());
+    fa[4..6].copy_from_slice(&2u16.to_le_bytes());
+    fa[7] = 7;
+    fa[8..10].copy_from_slice(&0x0F00u16.to_le_bytes());
+    fa[11] = 0x02;
+    fa[12] = 0x01;
+    let mut dg_fa = RawDatagram::new_positioned(EcatCmd::Fpwr, 4, 0x1001, 0x0600, fa);
+    dg_fa.wkc = 1;
+    let mut fb = vec![0u8; 16];
+    fb[0..4].copy_from_slice(&0x0005_0002u32.to_le_bytes());
+    fb[4..6].copy_from_slice(&2u16.to_le_bytes());
+    fb[7] = 7;
+    fb[8..10].copy_from_slice(&0x1100u16.to_le_bytes());
+    fb[11] = 0x01;
+    fb[12] = 0x01;
+    let mut dg_fb = RawDatagram::new_positioned(EcatCmd::Fpwr, 5, 0x1002, 0x0600, fb);
+    dg_fb.wkc = 1;
+    bm2.add_datagram(dg_fa);
+    bm2.add_datagram(dg_fb);
+    multi_frames.push((3_000_000, bm2.build().unwrap()));
+
+    // Frame 3: post-config LRW -> decodes BOTH `CmdA` (SlaveA) and `FeedbackB` (SlaveB)!
+    let mut m_payload = Vec::new();
+    m_payload.extend_from_slice(&0x4321u16.to_le_bytes());
+    m_payload.extend_from_slice(&0x8765u16.to_le_bytes());
+    let mut dg_m3 = RawDatagram::new_logical(EcatCmd::Lrw, 6, 0x0005_0000, m_payload);
+    dg_m3.wkc = 3;
+    let mut bm3 = EcatFrameBuilder::new();
+    bm3.add_datagram(dg_m3);
+    multi_frames.push((4_000_000, bm3.build().unwrap()));
+
+    let multi_pcap = tmp.join("multi_sii_xml.pcap");
+    write_pcap_file(&multi_pcap, &multi_frames).unwrap();
+    let cli_multi = Cli::try_parse_from([
+        "ethercat-cli",
+        "--format",
+        "json",
+        "dissect",
+        "--file",
+        multi_pcap.to_str().unwrap(),
+        "--xml",
+        xml_a_path.to_str().unwrap(),
+        "--xml",
+        xml_b_path.to_str().unwrap(),
+    ])
+    .expect("repeatable --xml CLI flags must parse");
+    let multi_rendered = execute_cli(&cli_multi).unwrap();
+    assert!(
+        multi_rendered.json["frames"][0]["frame"]["datagrams"][0]
+            .get("pdo_fields")
+            .is_none(),
+        "pre-config frame 0 must not decode PDOs"
+    );
+    let m_fr3 = &multi_rendered.json["frames"][3]["frame"]["wireshark_fields"];
+    assert_eq!(m_fr3["ecat.pdo.CmdA"], 0x4321);
+    assert_eq!(m_fr3["ecat.pdo.FeedbackB"], 0x8765);
+
+    // 7. Audit documented Wireshark selectors in `crate::selector::WIRESHARK_FIELD_CATALOG`
+    //    and verify live `-f` extraction on `ioraw.header`, `ioraw.data`, `ecat.syncman.start`, etc.
+    for stale in [
+        "ioraw.summary",
+        "ecat.syncman.pstart",
+        "ecat_mailbox.eoe.macfilter.filtercount",
+        "ams.ads.indexgroup",
+        "tc_nv.cycle",
+        "tc_nv.var.id",
+    ] {
+        assert!(
+            !crate::selector::WIRESHARK_FIELD_CATALOG
+                .iter()
+                .any(|d| d.selector == stale),
+            "stale non-existent selector `{stale}` must not remain in WIRESHARK_FIELD_CATALOG"
+        );
+    }
+
+    // Build an `ioraw` frame (`ecatf.type == 3`) and verify `-f ioraw.header -f ioraw.data` resolves!
+    let mut raw_io_eth = vec![
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x01, 0x05, 0x10, 0x20, 0x30, 0x88, 0xA4,
+    ];
+    let ioraw_hdr = (8u16 & 0x07FF) | ((3u16) << 12);
+    raw_io_eth.extend_from_slice(&ioraw_hdr.to_le_bytes());
+    raw_io_eth.extend_from_slice(&[0x01, 0x02, 0x03, 0x04, 0xAA, 0xBB, 0xCC, 0xDD]);
+    raw_io_eth.resize(60, 0);
+    let ioraw_df = dissect_frame(&raw_io_eth, &DissectOptions::default()).unwrap();
+    let ioraw_proj = apply_field_selectors(
+        &serde_json::to_value(&ioraw_df).unwrap(),
+        &["ioraw.header".to_string(), "ioraw.data".to_string()],
+    )
+    .expect("ioraw.header and ioraw.data selectors must resolve");
+    assert_eq!(ioraw_proj["ioraw.header"], "01020304");
+    assert_eq!(ioraw_proj["ioraw.data"], "aabbccdd");
+
+    // Build a `tc_nv` frame (`ecatf.type == 4`) with official 12-byte `NvParserHDR` (`[0..6]` MAC,
+    // `[6..8]` Count, `[8..10]` CycleIndex, `[10..12]` 2 reserved bytes) + 1 variable!
+    let mut nv_body = Vec::new();
+    nv_body.extend_from_slice(&[0x00, 0x01, 0x05, 0xAA, 0xBB, 0xCC]); // Publisher MAC
+    nv_body.extend_from_slice(&1u16.to_le_bytes()); // Count = 1
+    nv_body.extend_from_slice(&42u16.to_le_bytes()); // CycleIndex = 42
+    nv_body.extend_from_slice(&[0u8; 2]); // 2 reserved bytes (12-byte header total)
+    nv_body.extend_from_slice(&10u16.to_le_bytes()); // id = 10
+    nv_body.extend_from_slice(&0x1234u16.to_le_bytes()); // hash = 0x1234
+    nv_body.extend_from_slice(&4u16.to_le_bytes()); // length = 4
+    nv_body.extend_from_slice(&1u16.to_le_bytes()); // quality = 1
+    nv_body.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // data
+    let mut nv_eth = vec![
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x01, 0x05, 0x10, 0x20, 0x30, 0x88, 0xA4,
+    ];
+    let nv_hdr = ((nv_body.len() as u16) & 0x07FF) | ((4u16) << 12);
+    nv_eth.extend_from_slice(&nv_hdr.to_le_bytes());
+    nv_eth.extend_from_slice(&nv_body);
+    nv_eth.resize(60, 0);
+    let nv_df = dissect_frame(&nv_eth, &DissectOptions::default()).unwrap();
+    let nv_proj = apply_field_selectors(
+        &serde_json::to_value(&nv_df).unwrap(),
+        &[
+            "tc_nv.header".to_string(),
+            "tc_nv.publisher".to_string(),
+            "tc_nv.count".to_string(),
+            "tc_nv.cycleindex".to_string(),
+            "tc_nv.id".to_string(),
+            "tc_nv.hash".to_string(),
+            "tc_nv.length".to_string(),
+            "tc_nv.quality".to_string(),
+            "tc_nv.data".to_string(),
+        ],
+    )
+    .expect("tc_nv.* selectors must resolve");
+    assert_eq!(nv_proj["tc_nv.header"].as_str().unwrap().len(), 24); // 12 bytes = 24 hex chars
+    assert_eq!(nv_proj["tc_nv.publisher"], "00:01:05:aa:bb:cc");
+    assert_eq!(nv_proj["tc_nv.count"], 1);
+    assert_eq!(nv_proj["tc_nv.cycleindex"], 42);
+    assert_eq!(nv_proj["tc_nv.id"], "0x000a");
+    assert_eq!(nv_proj["tc_nv.hash"], "0x1234");
+    assert_eq!(nv_proj["tc_nv.length"], 4);
+    assert_eq!(nv_proj["tc_nv.quality"], "0x0001");
+    assert_eq!(nv_proj["tc_nv.data"], "deadbeef");
+
+    // Verify `ecat.fmmu.lstart` + `ecat.fmmu.activate0` on `multi_rendered.json` Frame 2 (`0x0600`)
+    // and `ecat.syncman.start` on an `0x0810` SyncManager frame!
+    let fmmu_proj = apply_field_selectors(
+        &multi_rendered.json,
+        &[
+            "ecat.fmmu.lstart".to_string(),
+            "ecat.fmmu.activate0".to_string(),
+        ],
+    )
+    .expect("ecat.fmmu.lstart and ecat.fmmu.activate0 selectors must resolve");
+    assert_eq!(fmmu_proj.as_array().unwrap().len(), 1);
+
+    let mut dg_sm_sel = RawDatagram::new_positioned(
+        EcatCmd::Fpwr,
+        1,
+        0x1001,
+        0x0810,
+        vec![0x00, 0x11, 6, 0, 0x24, 0x00, 0x01, 0x00],
+    );
+    dg_sm_sel.wkc = 1;
+    let mut b_sm_sel = EcatFrameBuilder::new();
+    b_sm_sel.add_datagram(dg_sm_sel);
+    let sm_df = dissect_frame(&b_sm_sel.build().unwrap(), &DissectOptions::default()).unwrap();
+    let sm_proj = apply_field_selectors(
+        &serde_json::to_value(&sm_df).unwrap(),
+        &[
+            "ecat.syncman.start".to_string(),
+            "ecat.syncman.access".to_string(),
+        ],
+    )
+    .expect("ecat.syncman.start and ecat.syncman.access selectors must resolve");
+    assert_eq!(sm_proj["ecat.syncman.start"], "0x1100");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_xml_unit_types_and_text_summary_dissection() {
+    let tmp = std::env::temp_dir().join(format!("ethercat-xml-units-{}", unique_temp_id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let xml_path = tmp.join("servo_units.xml");
+    let pcap_path = tmp.join("servo_units.pcap");
+
+    let esi_xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<EtherCATInfo>
+  <Vendor><Id>#x00000931</Id><Name>UnitTestVendor</Name></Vendor>
+  <Descriptions>
+    <Devices>
+      <Device>
+        <Type ProductCode="#x00000402" RevisionNo="#x00010000">EC-SERVO</Type>
+        <Name>UnitServoDrive</Name>
+        <Sm StartAddress="#x1000" ControlByte="#x26" Enable="1">MBoxOut</Sm>
+        <Sm StartAddress="#x1080" ControlByte="#x22" Enable="1">MBoxIn</Sm>
+        <Sm StartAddress="#x1100" ControlByte="#x24" Enable="1">Outputs</Sm>
+        <Sm StartAddress="#x1180" ControlByte="#x20" Enable="1">Inputs</Sm>
+        <Mailbox><CoE SdoInfo="1" PdoAssign="1" PdoConfig="1" CompleteAccess="1"/></Mailbox>
+        <Profile>
+          <Dictionary>
+            <UnitTypes>
+              <UnitType>
+                <MasterType>#x00410000</MasterType>
+                <Notation>rpm</Notation>
+                <Name>Revolutions per minute</Name>
+              </UnitType>
+            </UnitTypes>
+            <DataTypes>
+              <DataType>
+                <Name>DT6060</Name>
+                <BaseType>SINT</BaseType>
+                <BitSize>8</BitSize>
+                <EnumInfo><Text>Cyclic synchronous velocity</Text><Enum>9</Enum></EnumInfo>
+              </DataType>
+            </DataTypes>
+            <Objects>
+              <Object>
+                <Index>#x6060</Index>
+                <Name>Modes of operation</Name>
+                <Type>DT6060</Type>
+                <BitSize>8</BitSize>
+                <Flags><Access>rw</Access><PdoMapping>R</PdoMapping></Flags>
+              </Object>
+              <Object>
+                <Index>#x60FF</Index>
+                <Name>Target velocity</Name>
+                <Type>DINT</Type>
+                <BitSize>32</BitSize>
+                <Info><Unit>#x00410000</Unit></Info>
+                <Flags><Access>rw</Access><PdoMapping>R</PdoMapping></Flags>
+              </Object>
+            </Objects>
+          </Dictionary>
+        </Profile>
+        <RxPdo Fixed="0" Sm="2">
+          <Index>#x1600</Index>
+          <Name>CSV Outputs</Name>
+          <Entry><Index>#x6060</Index><SubIndex>0</SubIndex><BitLen>8</BitLen></Entry>
+          <Entry><Index>#x60FF</Index><SubIndex>0</SubIndex><BitLen>32</BitLen></Entry>
+        </RxPdo>
+      </Device>
+    </Devices>
+  </Descriptions>
+</EtherCATInfo>
+"##;
+    std::fs::write(&xml_path, esi_xml).unwrap();
+
+    // Frame 0: Pre-configuration LWR -> must NOT decode PDO fields yet
+    let mut b0 = EcatFrameBuilder::new();
+    let mut dg0 = RawDatagram::new_logical(EcatCmd::Lwr, 1, 0, vec![9, 0x0C, 0xFE, 0xFF, 0xFF]);
+    dg0.wkc = 1;
+    b0.add_datagram(dg0);
+
+    // Frame 1: Assign station 0x1001 + Expedited SDO Download 0x60FF:00 = -500 rpm
+    let mut b1 = EcatFrameBuilder::new();
+    let mut dg_st = RawDatagram::new_positioned(EcatCmd::Apwr, 2, 0, 0x0010, vec![0x01, 0x10]);
+    dg_st.wkc = 1;
+    b1.add_datagram(dg_st);
+    let mut sdo_vel = vec![10, 0, 0, 0, 0, 0x13, 0x00, 0x20, 0x23, 0xFF, 0x60, 0x00];
+    sdo_vel.extend_from_slice(&(-500i32).to_le_bytes());
+    let mut dg_vel = RawDatagram::new_positioned(EcatCmd::Fpwr, 3, 0x1001, 0x1000, sdo_vel);
+    dg_vel.wkc = 1;
+    b1.add_datagram(dg_vel);
+
+    // Frame 2: Complete Access SDO Download 0x1C12:00 -> assign 0x1600 to SM2
+    let mut b2 = EcatFrameBuilder::new();
+    let sdo_1c12 = vec![
+        14, 0, 0, 0, 0, 0x23, 0x00, 0x20, 0x31, 0x12, 0x1C, 0x00, 4, 0, 0, 0, 1, 0, 0x00, 0x16,
+    ];
+    let mut dg_1c12 = RawDatagram::new_positioned(EcatCmd::Fpwr, 4, 0x1001, 0x1000, sdo_1c12);
+    dg_1c12.wkc = 1;
+    b2.add_datagram(dg_1c12);
+
+    // Frame 3: Post-configuration LWR -> must decode both Modes of operation (enum) & Target velocity (rpm)
+    let mut b3 = EcatFrameBuilder::new();
+    let mut dg3 = RawDatagram::new_logical(EcatCmd::Lwr, 5, 0, vec![9, 0x0C, 0xFE, 0xFF, 0xFF]);
+    dg3.wkc = 1;
+    b3.add_datagram(dg3);
+
+    let frames = vec![
+        (1_000u64, b0.build().unwrap()),
+        (2_000u64, b1.build().unwrap()),
+        (3_000u64, b2.build().unwrap()),
+        (4_000u64, b3.build().unwrap()),
+    ];
+    write_pcap_file(&pcap_path, &frames).unwrap();
+
+    let cli = Cli::try_parse_from([
+        "ethercat-cli",
+        "dissect",
+        "--file",
+        pcap_path.to_str().unwrap(),
+        "--xml",
+        xml_path.to_str().unwrap(),
+    ])
+    .unwrap();
+    let res = execute_cli(&cli).unwrap();
+    let frame_lines: Vec<&str> = res
+        .text
+        .lines()
+        .filter(|l| l.starts_with("[Frame #"))
+        .collect();
+    assert_eq!(frame_lines.len(), 4);
+
+    // Frame 0 (pre-config) has no pdo=[...]
+    assert!(
+        !frame_lines[0].contains("pdo="),
+        "pre-config line: {}",
+        frame_lines[0]
+    );
+
+    // Frame 1 shows SDO name, DINT format, signed -500 value, and UnitTypes-resolved "rpm" unit
+    assert!(
+        frame_lines[1].contains("0x60ff:00 Target velocity=-500 rpm (DINT)"),
+        "SDO line: {}",
+        frame_lines[1]
+    );
+    assert_eq!(
+        res.json["frames"][1]["frame"]["wireshark_fields"]["ecat_mailbox.coe.sdo.xml.unit"],
+        "rpm"
+    );
+
+    // Frame 3 (post-config) shows decoded PDO fields with type, enum text, and unit
+    assert!(
+        frame_lines[3].contains(
+            "pdo=[Modes of operation=9 (DT6060, Cyclic synchronous velocity), Target velocity=-500 rpm (DINT)]"
+        ),
+        "post-config PDO line: {}",
+        frame_lines[3]
+    );
+    assert_eq!(
+        res.json["frames"][3]["frame"]["wireshark_fields"]["ecat.pdo.Target_velocity.unit"],
+        "rpm"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn cli_wildcard_ws_selectors_and_multiframe_hex_dissect() {
+    let tmp = std::env::temp_dir().join(format!("ethercat_cli_wildcard_hex_{}", unique_temp_id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // 1. Mid-path `[*]` Wireshark selector (`ecat[*].wkc`, `ecat[*].cmd`) in numeric subframe order
+    let mut b_multi = EcatFrameBuilder::new();
+    let mut sub0 = RawDatagram::new_positioned(EcatCmd::Fpwr, 1, 0x1001, 0x0120, vec![0x04, 0x00]);
+    sub0.wkc = 1;
+    let mut sub1 = RawDatagram::new_logical(EcatCmd::Lrw, 2, 0x0001_0000, vec![0xAA, 0x55]);
+    sub1.wkc = 3;
+    b_multi.add_datagram(sub0);
+    b_multi.add_datagram(sub1);
+    let multi_hex = format_hex(&b_multi.build().unwrap());
+
+    let cli_wild = Cli::try_parse_from([
+        "ethercat-cli",
+        "-f",
+        "ecat[*].wkc",
+        "-f",
+        "ecat[*].cmd",
+        "dissect",
+        "--hex",
+        &multi_hex,
+    ])
+    .unwrap();
+    let wild_render = execute_cli(&cli_wild).unwrap();
+    let projected =
+        crate::selector::apply_field_selectors(&wild_render.json, &cli_wild.fields).unwrap();
+    assert_eq!(projected["ecat[*].wkc"], json!([1, 3]));
+    assert_eq!(projected["ecat[*].cmd"], json!(["FPWR", "LRW"]));
+
+    // 2. Multi-packet `.hex` file must preserve ALL packets and run stateful temporal PDO dissection
+    let xml_path = tmp.join("hex_drive.xml");
+    std::fs::write(
+        &xml_path,
+        r##"<?xml version="1.0" encoding="UTF-8"?>
+<EtherCATInfo>
+  <Vendor><Id>2</Id></Vendor>
+  <Descriptions><Devices><Device>
+    <Type ProductCode="#x11112222" RevisionNo="#x00010000">HexDrive</Type>
+    <Mailbox><CoE SdoInfo="1" PdoAssign="1" CompleteAccess="1"/></Mailbox>
+    <Sm StartAddress="#x1000" ControlByte="#x26" Enable="1">MBoxOut</Sm>
+    <Sm StartAddress="#x1080" ControlByte="#x22" Enable="1">MBoxIn</Sm>
+    <Sm StartAddress="#x1100" ControlByte="#x24" Enable="1">Outputs</Sm>
+    <RxPdo Sm="2" Mandatory="0" Fixed="0">
+      <Index>#x1600</Index>
+      <Entry><Index>#x6040</Index><SubIndex>0</SubIndex><BitLen>16</BitLen><Name>HexCtrl</Name><DataType>UINT</DataType></Entry>
+    </RxPdo>
+    <Profile><Dictionary><Objects>
+      <Object><Index>#x6040</Index><Name>HexCtrl</Name><Type>UINT</Type><BitSize>16</BitSize></Object>
+    </Objects></Dictionary></Profile>
+  </Device></Devices></Descriptions>
+</EtherCATInfo>"##,
+    )
+    .unwrap();
+
+    let mut f0 = EcatFrameBuilder::new();
+    f0.add_datagram(RawDatagram::new_logical(
+        EcatCmd::Lwr,
+        1,
+        0,
+        vec![0x11, 0x22],
+    ));
+
+    let mut mbx_ca = vec![0u8; 6 + 2 + 8 + 4];
+    mbx_ca[0..2].copy_from_slice(&14u16.to_le_bytes());
+    mbx_ca[2..4].copy_from_slice(&0x1001u16.to_le_bytes());
+    mbx_ca[5] = 0x13;
+    mbx_ca[6..8].copy_from_slice(&0x2000u16.to_le_bytes());
+    mbx_ca[8] = 0x31;
+    mbx_ca[9..11].copy_from_slice(&0x1C12u16.to_le_bytes());
+    mbx_ca[12..16].copy_from_slice(&4u32.to_le_bytes());
+    mbx_ca[16] = 1;
+    mbx_ca[18..20].copy_from_slice(&0x1600u16.to_le_bytes());
+    let mut f1 = EcatFrameBuilder::new();
+    let mut dg_ca = RawDatagram::new_positioned(EcatCmd::Fpwr, 2, 0x1001, 0x1000, mbx_ca);
+    dg_ca.wkc = 1;
+    f1.add_datagram(dg_ca);
+
+    let mut f2 = EcatFrameBuilder::new();
+    let mut dg_post = RawDatagram::new_logical(EcatCmd::Lwr, 3, 0, vec![0x34, 0x12]);
+    dg_post.wkc = 1;
+    f2.add_datagram(dg_post);
+
+    let hex_trace_path = tmp.join("multi_trace.hex");
+    let hex_lines = format!(
+        "{}\n{}\n{}\n",
+        format_hex(&f0.build().unwrap()),
+        format_hex(&f1.build().unwrap()),
+        format_hex(&f2.build().unwrap()),
+    );
+    std::fs::write(&hex_trace_path, hex_lines).unwrap();
+
+    let cli_hex = Cli::try_parse_from([
+        "ethercat-cli",
+        "dissect",
+        "--file",
+        hex_trace_path.to_str().unwrap(),
+        "--xml",
+        xml_path.to_str().unwrap(),
+    ])
+    .unwrap();
+    let res_hex = execute_cli(&cli_hex).unwrap();
+    assert_eq!(res_hex.json["dissected_count"], 3);
+    assert!(res_hex.json["frames"][0]["frame"]["datagrams"][0]["pdo_fields"].is_null());
+    assert_eq!(
+        res_hex.json["frames"][2]["frame"]["wireshark_fields"]["ecat.pdo.HexCtrl"],
+        0x1234
     );
 
     let _ = std::fs::remove_dir_all(&tmp);

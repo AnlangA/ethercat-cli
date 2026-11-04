@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/ethercat-wire",
+    "crates/ethercat-dissector",
     "crates/ethercat-eeprom",
     "crates/ethercat-master",
     "crates/ethercat-ssc",
@@ -26,6 +27,7 @@ serde_json = "1.0"
 thiserror = "2.0"
 
 ethercat-wire = { path = "crates/ethercat-wire" }
+ethercat-dissector = { path = "crates/ethercat-dissector" }
 ethercat-eeprom = { path = "crates/ethercat-eeprom" }
 ethercat-master = { path = "crates/ethercat-master" }
 ethercat-ssc = { path = "crates/ethercat-ssc" }

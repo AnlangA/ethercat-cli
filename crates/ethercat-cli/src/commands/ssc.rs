@@ -581,21 +581,9 @@ pub fn handle_ssc(sub: &SscSubcommand) -> Result<CommandRender> {
                 worksheet,
                 strict,
             } => {
-                let mut app = if let Some(ws) = worksheet {
-                    let mut base =
-                        parse_single_application_file_with_sheet(&inputs[0], false, Some(*ws))?;
-                    for extra in &inputs[1..] {
-                        let next =
-                            parse_single_application_file_with_sheet(extra, false, Some(*ws))?;
-                        for (_, obj) in next.od.objects {
-                            base.od.objects.insert(obj.index, obj);
-                        }
-                    }
-                    base.od.finalize_and_validate(true);
-                    base
-                } else {
-                    parse_application_files(inputs, false)?
-                };
+                let mut app = ethercat_ssc::od::parsers::parse_application_files_with_sheet(
+                    inputs, false, *worksheet,
+                )?;
                 let rep = app.od.validate_objects(*strict, false);
                 let mut lines = vec![format!(
                     "OD Check '{}': {} objects, {} errors, {} warnings",

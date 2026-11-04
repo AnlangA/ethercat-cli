@@ -2284,7 +2284,7 @@ fn parse_slave_file_element(
             SlaveFileContent::TextLines(lines)
         }
     } else {
-        let embedded = get_clear_value(&el.direct_text());
+        let embedded = el.direct_text();
         if embedded.is_empty() {
             if source_folder.is_some() && !name.eq_ignore_ascii_case("ecat_def.h") {
                 warnings.push(format!(
@@ -2295,8 +2295,7 @@ fn parse_slave_file_element(
         } else if file_type == SlaveFileType::Binary {
             SlaveFileContent::Binary(parse_setting_bytes(&embedded))
         } else {
-            let lines: Vec<String> = embedded.split("\r\n").map(String::from).collect();
-            SlaveFileContent::TextLines(lines)
+            SlaveFileContent::TextLines(split_text_lines(&embedded))
         }
     };
 

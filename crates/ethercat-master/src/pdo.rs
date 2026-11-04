@@ -13,7 +13,9 @@ use ethercat_wire::error::{CliError, Result};
 pub use ethercat_wire::pdo_codec::{
     decode_pdo_payload, encode_pdo_assignments, normalize_entry_key, PdoFieldDef, PdoLayout,
 };
-use ethercat_wire::protocol::constants::{ect_datatype_name, EcatCmd};
+use ethercat_wire::protocol::constants::{
+    al_state_name, ect_datatype_name, EcatCmd, EC_STATE_OPERATIONAL, EC_STATE_SAFE_OP,
+};
 use ethercat_wire::transport::EthercatTransport;
 use ethercat_wire::types::{decode_typed_value, extract_bits_le, format_hex, DataTypeSpec};
 
@@ -144,7 +146,7 @@ pub fn read_pdo_map_coe(
                         subindex: obj_sub,
                         name_idx: 0,
                         name: Some(resolved_name),
-                        data_type: u8::try_from(resolved_dt).unwrap_or(0),
+                        data_type: resolved_dt,
                         data_type_name: ect_datatype_name(resolved_dt),
                         bit_length: bit_len,
                         bit_offset: cum_bit_off,
@@ -216,13 +218,50 @@ pub fn read_slave_pdo_map(
             load_pdo_map_from_sii_bytes(&img, Some(slave))
         }
         PdoSource::Coe => read_pdo_map_coe(bus, slave, auto_preop, timeout),
-        PdoSource::Auto => match read_pdo_map_coe(bus, slave, auto_preop, timeout) {
-            Ok(rep) if !rep.rx_pdos.is_empty() || !rep.tx_pdos.is_empty() => Ok(rep),
-            _ => {
-                let img = read_device_sii_image(bus, slave, timeout)?;
-                load_pdo_map_from_sii_bytes(&img, Some(slave))
+        PdoSource::Auto => {
+            let aiadr = slave_aiadr(slave);
+            let (al_wkc, al_bytes) =
+                bus.send_datagram(EcatCmd::Aprd, aiadr, 0x0130, vec![0u8; 2], timeout)?;
+            if al_wkc == 0 {
+                return Err(CliError::Device(format!(
+                    "slave {slave} did not respond when reading AL Status (0x0130)"
+                )));
             }
-        },
+            let al_raw = u16::from_le_bytes([al_bytes[0], al_bytes[1]]);
+            let al_state = al_raw & 0x0F;
+            let in_safeop_or_op = matches!(al_state, EC_STATE_SAFE_OP | EC_STATE_OPERATIONAL);
+
+            if in_safeop_or_op {
+                let (_, sm_bytes) =
+                    bus.send_datagram(EcatCmd::Aprd, aiadr, 0x0800, vec![0u8; 16], timeout)?;
+                let wl = sii_le16(&sm_bytes[2..4]);
+                let sm0_active = (sm_bytes[6] & 0x01) != 0;
+                let rl = sii_le16(&sm_bytes[10..12]);
+                let sm1_active = (sm_bytes[14] & 0x01) != 0;
+                if wl == 0 || rl == 0 || !sm0_active || !sm1_active {
+                    return Err(CliError::Protocol(format!(
+                        "slave {slave} is in {} state (0x{al_state:02x}) without active CoE mailbox SyncManagers; refusing to seize SII EEPROM (0x0500) from PDI under automatic PDO discovery. Pass `--sii-file`, `--layout` (`--rx-layout`/`--tx-layout`), or explicit `--source sii`.",
+                        al_state_name(al_raw)
+                    )));
+                }
+            }
+
+            match read_pdo_map_coe(bus, slave, auto_preop, timeout) {
+                Ok(rep) if !rep.rx_pdos.is_empty() || !rep.tx_pdos.is_empty() => Ok(rep),
+                Ok(_) if in_safeop_or_op => Err(CliError::Protocol(format!(
+                    "slave {slave} CoE PDO assignment (0x1C12/0x1C13) is empty while in {} state (0x{al_state:02x}); refusing to seize SII EEPROM (0x0500) from PDI under automatic PDO discovery. Pass `--sii-file`, `--layout` (`--rx-layout`/`--tx-layout`), or explicit `--source sii`.",
+                    al_state_name(al_raw)
+                ))),
+                Err(coe_err) if in_safeop_or_op => Err(CliError::Protocol(format!(
+                    "CoE PDO discovery failed on slave {slave} in {} state (0x{al_state:02x}) ({coe_err}); refusing to seize SII EEPROM (0x0500) from PDI under automatic PDO discovery. Pass `--sii-file`, `--layout` (`--rx-layout`/`--tx-layout`), or explicit `--source sii`.",
+                    al_state_name(al_raw)
+                ))),
+                _ => {
+                    let img = read_device_sii_image(bus, slave, timeout)?;
+                    load_pdo_map_from_sii_bytes(&img, Some(slave))
+                }
+            }
+        }
     }
 }
 

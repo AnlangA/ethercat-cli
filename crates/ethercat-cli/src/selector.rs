@@ -67,13 +67,13 @@ pub const WIRESHARK_FIELD_CATALOG: &[FieldSelectorDoc] = &[
         selector: "esl.crcerror",
         layer: "Beckhoff ESL (ET2000)",
         value_type: "bool",
-        description: "Hardware FCS/CRC error flag recorded by ET2000 tap (bit 11)",
+        description: "Hardware FCS/CRC error flag recorded by ET2000 tap (bit 12, 0x1000)",
     },
     FieldSelectorDoc {
         selector: "esl.alignerror",
         layer: "Beckhoff ESL (ET2000)",
         value_type: "bool",
-        description: "Alignment error flag recorded by ET2000 tap (bit 12)",
+        description: "Alignment error flag recorded by ET2000 tap (bit 11, 0x0800)",
     },
     FieldSelectorDoc {
         selector: "esl.tsenable",
@@ -207,7 +207,7 @@ pub const WIRESHARK_FIELD_CATALOG: &[FieldSelectorDoc] = &[
         selector: "ecat.data",
         layer: "EtherCAT Datagram",
         value_type: "string (hex)",
-        description: "Datagram payload bytes encoded as lowercase hex",
+        description: "Wireshark 4.6 `ecat.data`: lowercase hex, only when no ESC register is fully covered, minus a recognized mailbox (`ecat[i].data` = full payload)",
     },
     FieldSelectorDoc {
         selector: "ecat.wkc",
@@ -522,7 +522,13 @@ pub const WIRESHARK_FIELD_CATALOG: &[FieldSelectorDoc] = &[
         selector: "ecat_mailbox.eoe.eth.dst",
         layer: "EoE (Ethernet over EtherCAT)",
         value_type: "string (MAC)",
-        description: "Inner Ethernet destination MAC on fragment 0 (also .eth.src, .eth.type, .vlan.id)",
+        description: "Inner Ethernet destination MAC (also .eth.src, .eth.type, .vlan.id, .arp.*, .ip.*, .ipv6.*, .icmp.*, .udp.*, .tcp.*)",
+    },
+    FieldSelectorDoc {
+        selector: "ecat_mailbox.eoe.reassembled_data",
+        layer: "EoE (Ethernet over EtherCAT)",
+        value_type: "string (hex)",
+        description: "Reassembled Ethernet frame hex payload across multi-fragment EoE transfers (also .reassembled_length)",
     },
     FieldSelectorDoc {
         selector: "ecat_mailbox.voe.vendor_id",
@@ -536,18 +542,84 @@ pub const WIRESHARK_FIELD_CATALOG: &[FieldSelectorDoc] = &[
         value_type: "string (hex u16)",
         description: "16-bit VoE Vendor Type",
     },
-    // Network Variables (`nv.*`)
+    // Network Variables (`tc_nv.*` / `nv.*`), Raw-IO (`ioraw.*`), Direct AMS (`ams.*`), DC Diff & XML SDO
+    FieldSelectorDoc {
+        selector: "tc_nv.publisher",
+        layer: "TwinCAT Network Variables",
+        value_type: "string (MAC)",
+        description: "Wireshark 4.6 `tc_nv` 6-byte Publisher MAC in 12-byte NvParserHDR (also `tc_nv.count`, `tc_nv.cycleindex`, `tc_nv.id`, `tc_nv.hash`, `tc_nv.length`, `tc_nv.quality`, `tc_nv.data`)",
+    },
     FieldSelectorDoc {
         selector: "nv.publisher_id",
         layer: "Network Variables",
-        value_type: "u16",
-        description: "EtherCAT Network Variables publisher ID",
+        value_type: "string (hex)",
+        description: "EtherCAT Network Variables 6-byte publisher identifier hex",
     },
     FieldSelectorDoc {
         selector: "nv.count",
         layer: "Network Variables",
-        value_type: "u8",
+        value_type: "u16",
         description: "Number of Network Variables in frame",
+    },
+    FieldSelectorDoc {
+        selector: "ioraw.header",
+        layer: "EtherCAT Raw-IO",
+        value_type: "string (hex)",
+        description: "Wireshark 4.6 `ioraw` 4-byte header (`ecatf.type == 3`; also `ioraw.data`)",
+    },
+    FieldSelectorDoc {
+        selector: "ioraw.data",
+        layer: "EtherCAT Raw-IO",
+        value_type: "string (hex)",
+        description: "Wireshark 4.6 `ioraw` direct process-image variable payload (`ecatf.type == 3`)",
+    },
+    FieldSelectorDoc {
+        selector: "ams.cmdid",
+        layer: "Beckhoff AMS / ADS",
+        value_type: "u16",
+        description: "Wireshark 4.6 AMS/ADS Command ID (`ecatf.type == 2`, `AMS/TCP 48898`, `AMS/UDP 48899`; also `ams.pdu_count`, `ams[i].*`, `ams.reassembled`, `ams.targetnetid`, `ams.sendernetid`, `ams.ads_indexgroup`, `ams.ads_indexoffset`, `ams.adsresult`)",
+    },
+    FieldSelectorDoc {
+        selector: "ecat.dc.dif.curtime",
+        layer: "Distributed Clocks",
+        value_type: "u32",
+        description: "CLI extension (not a Wireshark 4.6 field): DC `0x0910` `ARMW`/`FRMW` difference vs previous frame in nanoseconds. Official Wireshark DC port diffs are `ecat.dc.dif.da`, `.bd`, `.cb`, `.cd`, `.ba`, `.ca` (only for `APRD`/`FPRD` at `0x0900` with WKC > 0)",
+    },
+    FieldSelectorDoc {
+        selector: "ecat.fmmu.lstart",
+        layer: "ESC FMMU",
+        value_type: "string (hex u32)",
+        description: "Wireshark 4.6 canonical FMMU logical start address (`0x0600..0x06FF`; also `.llen`, `.pstart`, `.typeread`, `.typewrite`, `.activate0`)",
+    },
+    FieldSelectorDoc {
+        selector: "ecat.syncman.start",
+        layer: "ESC SyncManager",
+        value_type: "string (hex u16)",
+        description: "Wireshark 4.6 canonical SyncManager physical start address (`0x0800..0x087F`; also `.len`, `.enable`, `.access`, `.opmode`, `.1bufstate`)",
+    },
+    FieldSelectorDoc {
+        selector: "ecat_mailbox.foe.efw.cmd",
+        layer: "FoE Firmware (.efw)",
+        value_type: "string (hex u16)",
+        description: "Wireshark 4.6 FoE `.efw` firmware container command (also `.size`, `.addresslw`, `.addresshw`, `.data`)",
+    },
+    FieldSelectorDoc {
+        selector: "ecat_mailbox.eoe.macfilter.macfiltercount",
+        layer: "EoE MAC Filter",
+        value_type: "u8",
+        description: "Wireshark 4.6 EoE MAC filter count (also `.maskcount`, `.nobroadcasts`, `.filter`, `.filter0..15`, `.filtermask`, `.filtermask0..3`)",
+    },
+    FieldSelectorDoc {
+        selector: "ecat_mailbox.coe.sdoblk.seqno",
+        layer: "CoE SDO Block",
+        value_type: "u8",
+        description: "CoE SDO Block sub-block sequence number 1..127 (also `.last`, `.blksize`, `.ackseq`, `.unused`, `.crc`, `.crc_support`, `.crc_ok`, `.computed_crc`, `.pst`, `.data`, `ecat_mailbox.coe.sdo.reassembled_data`)",
+    },
+    FieldSelectorDoc {
+        selector: "ecat_mailbox.coe.sdo.xml.entry_name",
+        layer: "XML CoE SDO (--xml)",
+        value_type: "string",
+        description: "Object Dictionary subindex/object name resolved from `--xml` (also `.device_name`, `.object_name`, `.object_code`, `.data_type`, `.bit_size`, `.bit_length`, `.access`, `.unit`, `.value`, `.enum_text`, `.subitems`, `.reassembled_segments`, `.reassembled_len`, and `ams.coe.sdo.xml.*`)",
     },
     // SII / Command Output Convenience Selectors
     FieldSelectorDoc {
@@ -754,6 +826,86 @@ fn find_pdo_entry_in_array(arr: &[Value], key: &str) -> Option<Value> {
     None
 }
 
+fn match_ws_wildcard_indices(
+    chunks: &[&str],
+    key: &str,
+    allow_dot_tail: bool,
+) -> Option<Vec<usize>> {
+    let mut rem = key;
+    let first = chunks.first()?;
+    if rem.len() < first.len() || !rem[..first.len()].eq_ignore_ascii_case(first) {
+        return None;
+    }
+    rem = &rem[first.len()..];
+    let mut indices = Vec::with_capacity(chunks.len().saturating_sub(1));
+    for chunk in &chunks[1..] {
+        let after_open = rem.strip_prefix('[')?;
+        let close_pos = after_open.find(']')?;
+        let idx: usize = after_open[..close_pos].parse().ok()?;
+        indices.push(idx);
+        rem = &after_open[close_pos + 1..];
+        if rem.len() < chunk.len() || !rem[..chunk.len()].eq_ignore_ascii_case(chunk) {
+            return None;
+        }
+        rem = &rem[chunk.len()..];
+    }
+    if rem.is_empty() || (allow_dot_tail && rem.starts_with('.')) {
+        Some(indices)
+    } else {
+        None
+    }
+}
+
+fn eval_ws_wildcard(ws: &Map<String, Value>, sel: &str) -> Option<Value> {
+    if !sel.contains("[*]") {
+        return None;
+    }
+    let (core, trailing_star) = match sel.strip_suffix(".*") {
+        Some(p) => (p, true),
+        None => (sel, false),
+    };
+    let chunks: Vec<&str> = core.split("[*]").collect();
+    if chunks.len() < 2 {
+        return None;
+    }
+    if trailing_star {
+        let mut matched = Map::new();
+        for (k, v) in ws {
+            if match_ws_wildcard_indices(&chunks, k, true).is_some() {
+                matched.insert(k.clone(), v.clone());
+            }
+        }
+        if !matched.is_empty() {
+            return Some(Value::Object(matched));
+        }
+        return None;
+    }
+
+    let mut rows: Vec<(Vec<usize>, Value)> = Vec::new();
+    for (k, v) in ws {
+        if let Some(idxs) = match_ws_wildcard_indices(&chunks, k, false) {
+            rows.push((idxs, v.clone()));
+        }
+    }
+    if !rows.is_empty() {
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        return Some(Value::Array(rows.into_iter().map(|(_, v)| v).collect()));
+    }
+
+    // Singleton fallback when unindexed key exists (e.g. single AMS/UDP `ams.cmdid`)
+    if chunks.len() == 2 {
+        let singleton = format!("{}{}", chunks[0], chunks[1]);
+        if let Some(v) = ws.get(&singleton).or_else(|| {
+            ws.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&singleton))
+                .map(|(_, v)| v)
+        }) {
+            return Some(Value::Array(vec![v.clone()]));
+        }
+    }
+    None
+}
+
 /// Resolve a single selector against a JSON object/value (supporting Wireshark keys, wildcards,
 /// PDO/SII/SDO/Reg convenience aliases, and arbitrary JSON dot/index paths).
 pub fn resolve_single_selector(root: &Value, selector: &str) -> Option<Value> {
@@ -780,6 +932,9 @@ pub fn resolve_single_selector(root: &Value, selector: &str) -> Option<Value> {
                     .map(|(_, v)| v)
             }) {
                 return Some(exact.clone());
+            }
+            if let Some(wild_val) = eval_ws_wildcard(ws, sel) {
+                return Some(wild_val);
             }
             if let Some(prefix) = sel.strip_suffix(".*") {
                 let pfx_dot = format!("{prefix}.");

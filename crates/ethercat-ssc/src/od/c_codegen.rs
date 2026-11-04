@@ -1568,11 +1568,33 @@ pub fn render_application_c(
         )
     } else {
         let mut cb_block = String::new();
-        for (idx, (fn_name, is_write)) in callbacks.iter().enumerate() {
+        for (fn_name, is_write) in &callbacks {
             let rw_word = if *is_write { "write" } else { "read" };
-            let prefix = if idx == 0 { "{0}{0}" } else { "" };
             cb_block.push_str(&format!(
-                "{prefix}/////////////////////////////////////////////////////////////////////////////////////////{{0}}/**{{0}}\\param     index               index of the requested object.{{0}}\\param     subindex            subindex of the requested object.{{0}}\\param     objSize             size of the requested object data, calculated with OBJ_GetObjectLength{{0}}\\param     pData               Pointer to the buffer where the data can be copied to{{0}}\\param     bCompleteAccess     Indicates if a complete read of all subindices of the{{0}}                               object shall be done or not{{0}}{{0}} \\return    result of the read operation (0 (success) or an abort code (ABORTIDX_.... defined in{{0}}            sdosrv.h)){{0}} *////////////////////////////////////////////////////////////////////////////////////////{{0}}UINT8 {fn_name}(UINT16 index, UINT8 subindex, UINT32 dataSize, UINT16 MBXMEM * pData, UINT8 bCompleteAccess) {{{{{{0}}#if _WIN32{{0}}#pragma message (\"Warning: Implement CoE {rw_word} callback\"){{0}}#else{{0}} #warning \"Implement CoE {rw_word} callback\"{{0}}#endif{{0}} return 0;{{0}}}}}}"
+                concat!(
+                    "\r\n\r\n/////////////////////////////////////////////////////////////////////////////////////////\r\n",
+                    "/**\r\n",
+                    "\\param     index               index of the requested object.\r\n",
+                    "\\param     subindex            subindex of the requested object.\r\n",
+                    "\\param     objSize             size of the requested object data, calculated with OBJ_GetObjectLength\r\n",
+                    "\\param     pData               Pointer to the buffer where the data can be copied to\r\n",
+                    "\\param     bCompleteAccess     Indicates if a complete read of all subindices of the\r\n",
+                    "                               object shall be done or not\r\n",
+                    "\r\n",
+                    " \\return    result of the read operation (0 (success) or an abort code (ABORTIDX_.... defined in\r\n",
+                    "            sdosrv.h))\r\n",
+                    " *////////////////////////////////////////////////////////////////////////////////////////\r\n",
+                    "UINT8 {fn_name}(UINT16 index, UINT8 subindex, UINT32 dataSize, UINT16 MBXMEM * pData, UINT8 bCompleteAccess) {{\r\n",
+                    "#if _WIN32\r\n",
+                    "#pragma message (\"Warning: Implement CoE {rw_word} callback\")\r\n",
+                    "#else\r\n",
+                    " #warning \"Implement CoE {rw_word} callback\"\r\n",
+                    "#endif\r\n",
+                    " return 0;\r\n",
+                    "}}"
+                ),
+                fn_name = fn_name,
+                rw_word = rw_word,
             ));
         }
         let cb_section = format!("\r\n{cb_block}\r\n\r\n");

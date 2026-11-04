@@ -129,6 +129,8 @@ pub fn execute_cli(cli: &Cli) -> Result<CommandRender> {
             filter_cmd,
             pdo_layout,
             sii_pdo,
+            xml,
+            xml_device,
             save_pcap,
         } => frames::handle_capture(
             cli,
@@ -137,6 +139,8 @@ pub fn execute_cli(cli: &Cli) -> Result<CommandRender> {
             *filter_cmd,
             pdo_layout.as_deref(),
             sii_pdo.as_deref(),
+            xml,
+            xml_device.as_deref(),
             save_pcap.as_deref(),
         ),
         Commands::Fields { category, search } => {

@@ -1,0 +1,13 @@
+[package]
+name = "ethercat-dissector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Wireshark 4.6 EtherCAT protocol suite dissector (ecatf, ecat, esl, ecat_mailbox, ams, tc_nv, ioraw) with XML Object Dictionary SDO decoding and stateful temporal PDO dissection"
+
+[dependencies]
+ethercat-wire.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

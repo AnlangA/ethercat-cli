@@ -66,18 +66,11 @@ where
     let is_compressed_archive = (peek_len >= 2 && peek[0..2] == [0x1F, 0x8B])
         || (peek_len >= 4 && peek[0..4] == [0x28, 0xB5, 0x2F, 0xFD])
         || (peek_len >= 6 && peek[0..6] == [0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00]);
-    let has_compressed_ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|ext| {
-            matches!(
-                ext.to_ascii_lowercase().as_str(),
-                "gz" | "tgz" | "zst" | "xz"
-            )
-        });
     if is_compressed_archive
-        && (matches!(kind, FrameInputKind::Pcap | FrameInputKind::Pcapng)
-            || (kind == FrameInputKind::Auto && has_compressed_ext))
+        && matches!(
+            kind,
+            FrameInputKind::Auto | FrameInputKind::Pcap | FrameInputKind::Pcapng
+        )
     {
         return Err(CliError::Format(format!(
             "compressed capture archive '{}' (.gz/.zst/.xz) is not supported directly; decompress to .pcap or .pcapng first",
@@ -118,13 +111,48 @@ where
             {
                 stream_pktmon_or_hexdump(&text, &mut on_packet)?;
             } else {
-                let bytes = parse_hex_bytes(&text)?;
-                let _ = on_packet(CapturedPacketRecord {
-                    index: 0,
-                    timestamp: None,
-                    note: None,
-                    data: bytes,
-                })?;
+                let candidate_lines: Vec<&str> = text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("//"))
+                    .collect();
+                let parsed_lines: Option<Vec<Vec<u8>>> = if candidate_lines.len() >= 2 {
+                    candidate_lines
+                        .iter()
+                        .map(|l| {
+                            let b = parse_hex_bytes(l).ok()?;
+                            let looks_l2 = b.len() >= 28
+                                && (matches!(
+                                    u16::from_be_bytes([b[12], b[13]]),
+                                    0x88A4 | 0x8100 | 0x88A8 | 0x9100 | 0x0800 | 0x86DD
+                                ) || b.starts_with(&[0x01, 0x01, 0x05, 0x10, 0x00, 0x00]));
+                            looks_l2.then_some(b)
+                        })
+                        .collect()
+                } else {
+                    None
+                };
+
+                if let Some(frames) = parsed_lines {
+                    for (idx, data) in frames.into_iter().enumerate() {
+                        if !on_packet(CapturedPacketRecord {
+                            index: idx,
+                            timestamp: None,
+                            note: None,
+                            data,
+                        })? {
+                            break;
+                        }
+                    }
+                } else {
+                    let bytes = parse_hex_bytes(&text)?;
+                    let _ = on_packet(CapturedPacketRecord {
+                        index: 0,
+                        timestamp: None,
+                        note: None,
+                        data: bytes,
+                    })?;
+                }
             }
             Ok(FrameInputKind::Hex)
         }
@@ -172,12 +200,49 @@ fn detect_input_kind(path: &Path, raw: &[u8]) -> FrameInputKind {
             return FrameInputKind::Pcap;
         }
     }
-    // UTF-16LE BOM or UTF-16BE BOM -> text log (such as Windows PktMon .txt)
-    if raw.starts_with(&[0xFF, 0xFE]) || raw.starts_with(&[0xFE, 0xFF]) {
-        return FrameInputKind::Pktmon;
+    let ext_lower = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+
+    // UTF-16LE BOM or UTF-16BE BOM -> inspect extension & prefix so UTF-16 `.hex` / plain hex
+    // is not misclassified as PktMon while Windows PktMon `.txt` logs still resolve to `Pktmon`.
+    if let Some(body) = raw.strip_prefix(&[0xFF, 0xFE]) {
+        if ext_lower.as_deref() == Some("hex") {
+            return FrameInputKind::Hex;
+        }
+        let head = &body[..body.len().min(4094)];
+        let u16s: Vec<u16> = head
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| u16::from_le_bytes(c))
+            .collect();
+        let text = String::from_utf16_lossy(&u16s);
+        if text.contains("0x0000:") || text.contains("PktGroupId") {
+            return FrameInputKind::Pktmon;
+        }
+        return FrameInputKind::Hex;
     }
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        match ext.to_ascii_lowercase().as_str() {
+    if let Some(body) = raw.strip_prefix(&[0xFE, 0xFF]) {
+        if ext_lower.as_deref() == Some("hex") {
+            return FrameInputKind::Hex;
+        }
+        let head = &body[..body.len().min(4094)];
+        let u16s: Vec<u16> = head
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| u16::from_be_bytes(c))
+            .collect();
+        let text = String::from_utf16_lossy(&u16s);
+        if text.contains("0x0000:") || text.contains("PktGroupId") {
+            return FrameInputKind::Pktmon;
+        }
+        return FrameInputKind::Hex;
+    }
+    if let Some(ext) = ext_lower.as_deref() {
+        match ext {
             "pcap" => return FrameInputKind::Pcap,
             "pcapng" | "ntar" => return FrameInputKind::Pcapng,
             "txt" | "log" => {
@@ -893,4 +958,76 @@ pub fn write_pcapng_file(path: &Path, packets: &[(u64, Vec<u8>)]) -> Result<()> 
             format!("cannot write pcapng '{}': {e}", path.display()),
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode_utf16le_with_bom(s: &str) -> Vec<u8> {
+        let mut out = vec![0xFF, 0xFE];
+        for cu in s.encode_utf16() {
+            out.extend_from_slice(&cu.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn utf16le_hex_detection_and_gzip_pcap_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "ethercat_wire_pcap_io_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let hex_path = dir.join("frame_utf16le.hex");
+        let utf16_hex = encode_utf16le_with_bom("ff ff ff ff ff ff 00 11 22 33 44 55 88 a4\r\n");
+        std::fs::write(&hex_path, &utf16_hex).unwrap();
+
+        let mut packets = Vec::new();
+        let resolved = for_each_frame_in_file(&hex_path, FrameInputKind::Auto, |rec| {
+            packets.push(rec);
+            Ok(true)
+        })
+        .expect("load UTF-16LE .hex frame");
+        assert_eq!(resolved, FrameInputKind::Hex);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(
+            packets[0].data.as_slice(),
+            [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x88, 0xA4]
+        );
+
+        let pktmon_path = dir.join("pktmon_utf16le.txt");
+        let utf16_pktmon = encode_utf16le_with_bom(
+            "PktGroupId 1, PktNumber 1\r\n\t0x0000: ffff ffff ffff 0011 2233 4455 88a4\r\n",
+        );
+        std::fs::write(&pktmon_path, &utf16_pktmon).unwrap();
+        let mut pktmon_recs = Vec::new();
+        let pktmon_kind = for_each_frame_in_file(&pktmon_path, FrameInputKind::Auto, |rec| {
+            pktmon_recs.push(rec);
+            Ok(true)
+        })
+        .expect("load UTF-16LE PktMon .txt");
+        assert_eq!(pktmon_kind, FrameInputKind::Pktmon);
+        assert_eq!(pktmon_recs.len(), 1);
+
+        let gz_pcap_path = dir.join("compressed_capture.pcap");
+        std::fs::write(
+            &gz_pcap_path,
+            [0x1F, 0x8B, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03],
+        )
+        .unwrap();
+        let err = load_frames_from_file(&gz_pcap_path, FrameInputKind::Auto, 0)
+            .expect_err("gzip-compressed .pcap must report compressed archive error");
+        assert!(
+            matches!(&err, CliError::Format(msg) if msg.contains("compressed capture archive")),
+            "unexpected error: {err:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

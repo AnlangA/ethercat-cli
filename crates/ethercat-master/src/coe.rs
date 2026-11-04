@@ -4,13 +4,13 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::{slave_aiadr, write_al_state, EC_NODEOFFSET};
+use ethercat_dissector::{mbx_error_detail_description, sdo_info_entry_name_offset};
 use ethercat_eeprom::sii::image::sii_le16;
 use ethercat_eeprom::sii::ops::read_device_sii_slice;
 use ethercat_wire::error::{CliError, Result};
 use ethercat_wire::protocol::constants::{
     ect_datatype_name, sdo_abort_description, AlStateSpec, EcatCmd, EC_STATE_PRE_OP,
 };
-use ethercat_wire::protocol::mailbox::{mbx_error_detail_description, sdo_info_entry_name_offset};
 use ethercat_wire::transport::EthercatTransport;
 use ethercat_wire::types::{
     decode_typed_value, encode_typed_value, extract_bits_le, format_hex, is_decimal_float_literal,
@@ -144,14 +144,14 @@ pub fn prepare_slave_mailbox(
     })
 }
 
-fn mbx_drain_stale(bus: &mut dyn EthercatTransport, cfg: &SlaveMailboxConfig) {
+fn mbx_drain_stale(bus: &mut dyn EthercatTransport, cfg: &SlaveMailboxConfig, timeout: Duration) {
     for _ in 0..8 {
         let Ok((wkc, st)) = bus.send_datagram(
             EcatCmd::Fprd,
             cfg.station_addr,
             0x080D,
             vec![0u8; 1],
-            Duration::from_millis(15),
+            timeout,
         ) else {
             break;
         };
@@ -163,7 +163,7 @@ fn mbx_drain_stale(bus: &mut dyn EthercatTransport, cfg: &SlaveMailboxConfig) {
             cfg.station_addr,
             cfg.mbx_read_offset,
             vec![0u8; cfg.mbx_read_size as usize],
-            Duration::from_millis(15),
+            timeout,
         );
     }
 }
@@ -189,17 +189,17 @@ fn mbx_send(
     let deadline = start
         .checked_add(timeout)
         .unwrap_or_else(|| start + Duration::from_secs(3600));
-    let poll_timeout = timeout
-        .min(Duration::from_millis(200))
-        .max(Duration::from_millis(10));
     loop {
+        let step_timeout = timeout
+            .min(deadline.saturating_duration_since(Instant::now()))
+            .max(Duration::from_millis(1));
         // Check SM0 status bit 0x08 (0 = empty)
         let (wkc_s, st) = bus.send_datagram(
             EcatCmd::Fprd,
             cfg.station_addr,
             0x0805,
             vec![0u8; 1],
-            poll_timeout,
+            step_timeout,
         )?;
         if wkc_s > 0 && (st[0] & 0x08) == 0 {
             let (wkc_w, _) = bus.send_datagram(
@@ -236,16 +236,16 @@ fn mbx_recv(
     let deadline = start
         .checked_add(timeout)
         .unwrap_or_else(|| start + Duration::from_secs(3600));
-    let poll_timeout = timeout
-        .min(Duration::from_millis(200))
-        .max(Duration::from_millis(10));
     loop {
+        let step_timeout = timeout
+            .min(deadline.saturating_duration_since(Instant::now()))
+            .max(Duration::from_millis(1));
         let (wkc_s, st) = bus.send_datagram(
             EcatCmd::Fprd,
             cfg.station_addr,
             0x080D,
             vec![0u8; 1],
-            poll_timeout,
+            step_timeout,
         )?;
         if wkc_s > 0 && (st[0] & 0x08) != 0 {
             let (wkc_r, mbx) = bus.send_datagram(
@@ -425,7 +425,7 @@ pub fn sdo_read_raw(
             "SDO Complete Access requires subindex 0 or 1 (got subindex {subindex})"
         )));
     }
-    mbx_drain_stale(bus, cfg);
+    mbx_drain_stale(bus, cfg, timeout);
     let eff_sub = subindex;
     let mut req = vec![0u8; 8];
     req[0] = if complete_access { 0x50 } else { 0x40 };
@@ -694,7 +694,7 @@ pub fn sdo_write(
     })?;
 
     let mut cfg = prepare_slave_mailbox(bus, params.slave, params.auto_preop, params.timeout)?;
-    mbx_drain_stale(bus, &cfg);
+    mbx_drain_stale(bus, &cfg, params.timeout);
 
     // When `--type auto` is used on a scalar entry, consult SDO Info Entry Description if supported
     // so fixed-width CoE objects (e.g. 0x607A INTEGER32 or 0x6040 UNSIGNED16) encode at exact width.
@@ -980,7 +980,7 @@ pub fn query_od_info(
     timeout: Duration,
 ) -> Result<Vec<OdObjectReport>> {
     let mut cfg = prepare_slave_mailbox(bus, slave, auto_preop, timeout)?;
-    mbx_drain_stale(bus, &cfg);
+    mbx_drain_stale(bus, &cfg, timeout);
 
     let indices = if let Some(idx) = filter_index {
         vec![idx]

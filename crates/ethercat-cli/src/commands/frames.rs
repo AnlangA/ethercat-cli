@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -6,13 +7,15 @@ use serde_json::{json, Value};
 use crate::cli::{Cli, DatagramArgs, DissectArgs, FieldsCatalogFilter, FrameSubcommand};
 use crate::commands::{require_iface, resolve_offline_pdo_layout, write_file_bytes, CommandRender};
 use crate::selector::{FieldSelectorDoc, WIRESHARK_FIELD_CATALOG};
+use ethercat_dissector::{
+    dissect_frame, may_contain_ethercat, DissectOptions, DissectSession, DissectedFrame, XmlCatalog,
+};
 use ethercat_master::open_transport;
 use ethercat_master::{slave_aiadr, EC_NODEOFFSET};
 use ethercat_wire::error::{CliError, Result};
 use ethercat_wire::protocol::constants::{
     al_status_code_description, sdo_abort_description, EcatCmd, ESC_REGISTERS,
 };
-use ethercat_wire::protocol::dissector::{dissect_frame, may_contain_ethercat, DissectOptions};
 use ethercat_wire::protocol::frame::{parse_dlpdu_datagram_refs, EcatFrameBuilder, RawDatagram};
 use ethercat_wire::protocol::pcap_io::{for_each_frame_in_file, write_pcap_file, FrameInputKind};
 use ethercat_wire::types::{
@@ -174,10 +177,7 @@ pub fn handle_frame(cli: &Cli, sub: &FrameSubcommand, timeout: Duration) -> Resu
                 (raw, dissected)
             } else if let Some(path) = file {
                 let mut single_raw: Option<Vec<u8>> = None;
-                let mut first_ecat: Option<(
-                    Vec<u8>,
-                    ethercat_wire::protocol::dissector::DissectedFrame,
-                )> = None;
+                let mut first_ecat: Option<(Vec<u8>, DissectedFrame)> = None;
                 let mut skipped_non_ecat = 0usize;
                 let resolved_kind = for_each_frame_in_file(path, FrameInputKind::Auto, |rec| {
                     if !may_contain_ethercat(&rec.data, false) {
@@ -399,9 +399,16 @@ fn build_dissect_options(
     pdo_layout: Option<&str>,
     sii_pdo: Option<&Path>,
     pdo_dir: &str,
+    xml_paths: &[PathBuf],
+    xml_device: Option<&str>,
 ) -> Result<DissectOptions> {
     let layout = if pdo_layout.is_some() || sii_pdo.is_some() {
         Some(resolve_offline_pdo_layout(pdo_layout, sii_pdo, pdo_dir)?)
+    } else {
+        None
+    };
+    let xml_catalog = if !xml_paths.is_empty() {
+        Some(Arc::new(XmlCatalog::load_from_paths(xml_paths)?))
     } else {
         None
     };
@@ -409,13 +416,116 @@ fn build_dissect_options(
         bare_ecat: bare,
         force_mailbox,
         pdo_layout: layout,
+        xml_catalog,
+        xml_device: xml_device.map(|s| s.to_string()),
     })
 }
 
-fn summarize_dissected_frame_line(
-    idx: usize,
-    f: &ethercat_wire::protocol::dissector::DissectedFrame,
-) -> String {
+fn format_type_and_enum_suffix(dtype: Option<&str>, enum_text: Option<&str>) -> String {
+    let dt = dtype.map(str::trim).filter(|s| !s.is_empty());
+    let et = enum_text.map(str::trim).filter(|s| !s.is_empty());
+    match (dt, et) {
+        (Some(d), Some(e)) => format!(" ({d}, {e})"),
+        (Some(d), None) => format!(" ({d})"),
+        (None, Some(e)) => format!(" ({e})"),
+        (None, None) => String::new(),
+    }
+}
+
+fn format_sdo_xml_inline(sx: &Value) -> String {
+    let idx = sx["index"].as_str().unwrap_or("");
+    let idx_part = if let Some(sub) = sx["subindex"].as_u64() {
+        if idx.is_empty() {
+            String::new()
+        } else {
+            format!("{idx}:{sub:02x} ")
+        }
+    } else if !idx.is_empty() {
+        format!("{idx} ")
+    } else {
+        String::new()
+    };
+
+    let obj_name = sx["object_name"].as_str().unwrap_or("");
+    let entry_name = sx["entry_name"].as_str().unwrap_or("");
+    let name = if !entry_name.is_empty()
+        && !obj_name.is_empty()
+        && !entry_name.eq_ignore_ascii_case(obj_name)
+    {
+        format!("{obj_name}.{entry_name}")
+    } else if !entry_name.is_empty() {
+        entry_name.to_string()
+    } else if !obj_name.is_empty() {
+        obj_name.to_string()
+    } else {
+        "SDO".to_string()
+    };
+
+    let dtype = sx["data_type"].as_str();
+    let subs_opt = sx["subitems"].as_array().filter(|a| !a.is_empty());
+    if let Some(subs) = subs_opt {
+        let shown: Vec<String> = subs
+            .iter()
+            .take(4)
+            .map(|si| {
+                let sname = si["name"].as_str().unwrap_or("?");
+                let sdt = si["data_type"].as_str();
+                let set = si["enum_text"].as_str();
+                let sval = &si["value"];
+                format!("{sname}={sval}{}", format_type_and_enum_suffix(sdt, set))
+            })
+            .collect();
+        let more = if subs.len() > 4 {
+            format!(", +{} more", subs.len() - 4)
+        } else {
+            String::new()
+        };
+        format!("{idx_part}{name}={{{}{more}}}", shown.join(", "))
+    } else if let Some(val) = sx.get("value").filter(|v| !v.is_null()) {
+        let unit_part = sx["unit"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|u| format!(" {u}"))
+            .unwrap_or_default();
+        let meta = format_type_and_enum_suffix(dtype, sx["enum_text"].as_str());
+        format!("{idx_part}{name}={val}{unit_part}{meta}")
+    } else {
+        let meta = format_type_and_enum_suffix(dtype, None);
+        format!("{idx_part}{name}{meta}")
+    }
+}
+
+fn format_pdo_fields_inline(pf: &[Value]) -> String {
+    if pf.is_empty() {
+        return String::new();
+    }
+    let shown: Vec<String> = pf
+        .iter()
+        .take(6)
+        .map(|item| {
+            let name = item["name"].as_str().unwrap_or("?");
+            let val = &item["value"];
+            let unit = item["unit"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|u| format!(" {u}"))
+                .unwrap_or_default();
+            let meta =
+                format_type_and_enum_suffix(item["type"].as_str(), item["enum_text"].as_str());
+            format!("{name}={val}{unit}{meta}")
+        })
+        .collect();
+    let more = if pf.len() > 6 {
+        format!(", +{} more", pf.len() - 6)
+    } else {
+        String::new()
+    };
+    format!(" pdo=[{}{more}]", shown.join(", "))
+}
+
+fn summarize_dissected_frame_line(idx: usize, f: &DissectedFrame) -> String {
     let encap = f
         .ethernet
         .as_ref()
@@ -435,22 +545,86 @@ fn summarize_dissected_frame_line(
             let mbx_tag = d
                 .mailbox
                 .as_ref()
-                .map(|m| format!(" mbx={}", m.mbx_type_name))
+                .map(|m| {
+                    if let Some(sx) = m.protocol.get("sdo_xml") {
+                        format!(" mbx={}[{}]", m.mbx_type_name, format_sdo_xml_inline(sx))
+                    } else {
+                        format!(" mbx={}", m.mbx_type_name)
+                    }
+                })
+                .unwrap_or_default();
+            let pdo_tag = d
+                .pdo_fields
+                .as_ref()
+                .map(|pf| format_pdo_fields_inline(pf))
                 .unwrap_or_default();
             format!(
-                "{}({}) len={} WKC={}{}",
-                d.cmd_mnemonic, addr, d.length, d.wkc, mbx_tag
+                "{}({}) len={} WKC={}{}{}",
+                d.cmd_mnemonic, addr, d.length, d.wkc, mbx_tag, pdo_tag
             )
         })
         .collect();
+    let fallback_desc = if let Some(ams) = &f.direct_ams {
+        let sx_tags: Vec<String> = if let Some(pdus) = ams.get("pdus").and_then(Value::as_array) {
+            pdus.iter()
+                .filter_map(|p| p.get("sdo_xml").map(format_sdo_xml_inline))
+                .collect()
+        } else {
+            ams.get("sdo_xml")
+                .map(|sx| vec![format_sdo_xml_inline(sx)])
+                .unwrap_or_default()
+        };
+        let sx_tag = if sx_tags.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", sx_tags.join(" ; "))
+        };
+        let pdu_cnt = ams.get("pdu_count").and_then(Value::as_u64).unwrap_or(1);
+        let cnt_tag = if pdu_cnt > 1 {
+            format!(" ({pdu_cnt} PDUs)")
+        } else {
+            String::new()
+        };
+        format!(
+            "AMS {}{} {}:{} -> {}:{}{}",
+            ams["cmd_name"].as_str().unwrap_or(""),
+            cnt_tag,
+            ams["sender_net_id"].as_str().unwrap_or(""),
+            ams["sender_port"].as_u64().unwrap_or(0),
+            ams["target_net_id"].as_str().unwrap_or(""),
+            ams["target_port"].as_u64().unwrap_or(0),
+            sx_tag,
+        )
+    } else if let Some(mbx) = &f.direct_mailbox {
+        let sx_tag = mbx
+            .protocol
+            .get("sdo_xml")
+            .map(|sx| format!(" [{}]", format_sdo_xml_inline(sx)))
+            .unwrap_or_default();
+        format!(
+            "MBX {} addr=0x{:04x} len={}{}",
+            mbx.mbx_type_name, mbx.address, mbx.length, sx_tag
+        )
+    } else if let Some(nv) = &f.network_variables {
+        format!(
+            "TC-NV pub={} count={} cycle={}",
+            nv["publisher"].as_str().unwrap_or("-"),
+            nv["count"].as_u64().unwrap_or(0),
+            nv["cycle_index"].as_u64().unwrap_or(0),
+        )
+    } else if f.raw_io.is_some() {
+        "RAW-IO".to_string()
+    } else {
+        f.ecat_header["type_name"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    };
     format!(
         "[Frame #{idx}] {}B {encap} | {}",
         f.frame_wire_len,
         if dgs.is_empty() {
-            f.ecat_header["type_name"]
-                .as_str()
-                .unwrap_or("")
-                .to_string()
+            fallback_desc
         } else {
             dgs.join(" ; ")
         }
@@ -464,6 +638,8 @@ pub fn handle_dissect(args: &DissectArgs) -> Result<CommandRender> {
         args.pdo_layout.as_deref(),
         args.sii_pdo.as_deref(),
         &args.pdo_dir,
+        &args.xml,
+        args.xml_device.as_deref(),
     )?;
 
     if let Some(ref hex_str) = args.hex {
@@ -489,8 +665,10 @@ pub fn handle_dissect(args: &DissectArgs) -> Result<CommandRender> {
     let mut frames_json = Vec::new();
     let mut lines = Vec::new();
     let mut skipped_non_ecat = 0usize;
+    let mut session = DissectSession::new(opts.clone());
 
-    // Stream packets incrementally; fast-filter non-EtherCAT packets before full dissection.
+    // Stream packets incrementally through stateful DissectSession (enabling segmented SDO
+    // reassembly and temporal PDO configuration tracking across the capture sequence).
     let resolved_kind = for_each_frame_in_file(path, args.input_kind, |rec| {
         if !may_contain_ethercat(&rec.data, opts.bare_ecat) {
             if single_raw.is_none() && frames_json.is_empty() {
@@ -499,7 +677,7 @@ pub fn handle_dissect(args: &DissectArgs) -> Result<CommandRender> {
             skipped_non_ecat += 1;
             return Ok(true);
         }
-        match dissect_frame(&rec.data, &opts) {
+        match session.dissect_packet(rec.index, &rec.data) {
             Ok(df) => {
                 lines.push(summarize_dissected_frame_line(rec.index, &df));
                 frames_json.push(json!({
@@ -520,7 +698,9 @@ pub fn handle_dissect(args: &DissectArgs) -> Result<CommandRender> {
         }
     })?;
 
-    if matches!(resolved_kind, FrameInputKind::Bin | FrameInputKind::Hex) {
+    if resolved_kind == FrameInputKind::Bin
+        || (resolved_kind == FrameInputKind::Hex && frames_json.len() <= 1)
+    {
         if let Some(mut entry) = frames_json.pop() {
             let line = lines.pop().unwrap_or_default();
             return Ok(CommandRender {
@@ -564,6 +744,7 @@ pub fn handle_dissect(args: &DissectArgs) -> Result<CommandRender> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn handle_capture(
     cli: &Cli,
     count: usize,
@@ -571,10 +752,15 @@ pub fn handle_capture(
     filter_cmd: Option<EcatCmd>,
     pdo_layout: Option<&str>,
     sii_pdo: Option<&Path>,
+    xml_paths: &[PathBuf],
+    xml_device: Option<&str>,
     save_pcap: Option<&Path>,
 ) -> Result<CommandRender> {
     let iface = require_iface(cli)?;
-    let opts = build_dissect_options(false, false, pdo_layout, sii_pdo, "tx")?;
+    let opts = build_dissect_options(
+        false, false, pdo_layout, sii_pdo, "tx", xml_paths, xml_device,
+    )?;
+    let mut session = DissectSession::new(opts.clone());
     let mut bus = open_transport(&iface, true)?;
 
     let now = Instant::now();
@@ -584,6 +770,7 @@ pub fn handle_capture(
     let mut pcap_rows: Vec<(u64, Vec<u8>)> = Vec::new();
     let mut packets_json = Vec::new();
     let mut lines = Vec::new();
+    let mut raw_seq = 0usize;
 
     while packets_json.len() < count && Instant::now() < deadline {
         let rem = deadline.saturating_duration_since(Instant::now());
@@ -595,7 +782,9 @@ pub fn handle_capture(
             if !may_contain_ethercat(&raw, opts.bare_ecat) {
                 continue;
             }
-            if let Ok(df) = dissect_frame(&raw, &opts) {
+            let seq = raw_seq;
+            raw_seq += 1;
+            if let Ok(df) = session.dissect_packet(seq, &raw) {
                 if let Some(cmd_filter) = filter_cmd {
                     let hit = df.datagrams.iter().any(|d| d.cmd == cmd_filter.code());
                     if !hit {

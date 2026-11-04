@@ -8,12 +8,11 @@ pub mod types;
 mod tests {
     use crate::pdo_codec::{decode_pdo_payload, encode_pdo_assignments, PdoLayout};
     use crate::protocol::constants::EcatCmd;
-    use crate::protocol::dissector::{dissect_frame, may_contain_ethercat, DissectOptions};
     use crate::protocol::frame::{EcatFrameBuilder, RawDatagram};
     use crate::types::{extract_bits_le, insert_bits_le, parse_u64, DataTypeSpec};
 
     #[test]
-    fn wire_frame_dissector_and_pdo_codec_roundtrip() {
+    fn wire_frame_and_pdo_codec_roundtrip() {
         assert_eq!(parse_u64("#x08A4").unwrap(), 0x08A4);
 
         let layout = PdoLayout::parse_spec("ctrl:u16@0,target:i32@16").unwrap();
@@ -33,20 +32,10 @@ mod tests {
         let mut builder = EcatFrameBuilder::new();
         builder.add_datagram(dg);
         let raw = builder.build().unwrap();
-        assert!(may_contain_ethercat(&raw, false));
-
-        let df = dissect_frame(
-            &raw,
-            &DissectOptions {
-                pdo_layout: Some(layout),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(df.datagrams.len(), 1);
-        assert_eq!(df.datagrams[0].wkc, 3);
-        assert_eq!(df.wireshark_fields["ecat.pdo.ctrl"], 15);
-        assert_eq!(df.wireshark_fields["ecat.pdo.target"], -500);
+        assert_eq!(&raw[12..14], &[0x88, 0xA4]);
+        let parsed = crate::protocol::frame::parse_dlpdu_datagrams(&raw).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].wkc, 3);
 
         let mut bits = [0x00u8, 0x00];
         insert_bits_le(&mut bits, 4, 8, &[0xAB]).unwrap();

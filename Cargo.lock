@@ -131,12 +131,24 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "ethercat-dissector",
  "ethercat-eeprom",
  "ethercat-master",
  "ethercat-ssc",
  "ethercat-wire",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "ethercat-dissector"
+version = "1.0.0"
+dependencies = [
+ "ethercat-wire",
+ "hex",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -155,6 +167,7 @@ name = "ethercat-master"
 version = "1.0.0"
 dependencies = [
  "clap",
+ "ethercat-dissector",
  "ethercat-eeprom",
  "ethercat-wire",
  "serde",
